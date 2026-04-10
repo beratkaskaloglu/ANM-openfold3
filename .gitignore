@@ -1,0 +1,38 @@
+# External repos (clone separately)
+openfold3-repo/
+openfold3-mlx/
+
+# Obsidian
+.obsidian/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+.env
+.venv/
+env/
+
+# Data & checkpoints
+*.pt
+*.pth
+*.ckpt
+pair_reprs/
+coords/
+checkpoints/
+pdb_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+Başlıksız.canvas
