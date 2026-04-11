@@ -141,7 +141,7 @@ def run_single_protein(
             config,
             num_diffusion_samples=1,
             num_model_seeds=1,
-            use_msa_server=True,
+            use_msa_server=False,
             use_templates=False,
             output_dir=out_dir,
         )
