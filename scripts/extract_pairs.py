@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Phase 2: Chunked OpenFold3 inference — 10 proteins at a time.
+"""Phase 2+3 combined: Chunked OpenFold3 inference with inline shard packing.
 
-Extracts pair representations (zij_trunk) and Cα coordinates.
-Resume-safe: skips chunks with .ok markers.
+Every SHARD_SIZE proteins (default 50):
+  1. Run inference in chunks of 10 → save .pt
+  2. Download PDB → extract Cα coords → save .pt
+  3. Pack completed .pt files into .npz shard
+  4. Delete .pt files to free disk
+
+Resume-safe: skips shards with existing .npz + .ok marker.
+Disk usage stays under ~2 GB at all times.
 
 Usage:
-    python scripts/extract_pairs.py --pdb-list data/pdb_2000.json --chunk-size 10
-    python scripts/extract_pairs.py --start 500 --end 1000  # resume from protein 500
+    python scripts/extract_pairs.py --pdb-list data/pdb_2000.json
+    python scripts/extract_pairs.py --start 500 --end 1000
 """
 
 import argparse
@@ -25,11 +31,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("data/extract_pairs.log"),
     ],
 )
 logger = logging.getLogger(__name__)
 
+
+# ── OpenFold3 setup ──────────────────────────────────────────────
 
 def setup_openfold3():
     """Import and configure OpenFold3 for inference."""
@@ -45,6 +52,8 @@ def setup_openfold3():
         )
         sys.exit(1)
 
+
+# ── Single protein inference ─────────────────────────────────────
 
 def write_query_json(pdb_id: str, sequence: str, query_dir: Path) -> Path:
     """Write OpenFold3 query JSON for a single protein."""
@@ -75,14 +84,12 @@ def run_single_protein(
     InferenceExperimentConfig,
     run_inference,
 ) -> bool:
-    """Run OpenFold3 inference for a single protein and extract pair repr."""
-    # Check if already cached
+    """Run OpenFold3 inference for one protein and save pair repr .pt."""
     pair_file = pair_repr_dir / f"{pdb_id}_pair_repr.pt"
     if pair_file.exists():
         logger.info("  %s: cached", pdb_id)
         return True
 
-    # Per-protein isolated MSA directory
     msa_dir = Path(f"/tmp/of3_msa_{pdb_id}")
     if msa_dir.exists():
         shutil.rmtree(msa_dir, ignore_errors=True)
@@ -91,14 +98,14 @@ def run_single_protein(
     try:
         query_file = write_query_json(pdb_id, sequence, query_dir)
 
-        config_args = {
-            "output_writer_settings": {
+        config = InferenceExperimentConfig(
+            output_writer_settings={
                 "structure_format": "cif",
                 "write_latent_outputs": True,
                 "write_full_confidence_scores": False,
                 "write_features": False,
             },
-            "model_update": {
+            model_update={
                 "custom": {
                     "settings": {
                         "memory": {
@@ -111,62 +118,43 @@ def run_single_protein(
                     }
                 }
             },
-            "msa_computation_settings": {
+            msa_computation_settings={
                 "msa_output_directory": str(msa_dir),
                 "cleanup_msa_dir": True,
                 "save_mappings": False,
             },
-        }
+        )
 
-        config = InferenceExperimentConfig(**config_args)
         run_inference(
             queries_json=str(query_file),
             output_dir=str(output_dir),
             experiment_config=config,
         )
 
-        # Find and extract pair representation
-        zij_path = None
-        for p in output_dir.rglob(f"*{pdb_id}*/**/zij_trunk*.pt"):
-            zij_path = p
-            break
-        if zij_path is None:
-            for p in output_dir.rglob(f"*{pdb_id}*/**/*latent*.pt"):
-                zij_path = p
-                break
+        # Find pair representation in output
+        for pattern in [
+            f"*{pdb_id}*/**/zij_trunk*.pt",
+            f"*{pdb_id}*/**/*latent*.pt",
+            f"*{pdb_id}*/**/*.pt",
+        ]:
+            for p in output_dir.rglob(pattern):
+                data = torch.load(p, map_location="cpu", weights_only=False)
+                if isinstance(data, dict) and "pair_repr" in data:
+                    torch.save({"pair_repr": data["pair_repr"]}, pair_file)
+                    logger.info("  %s: OK zij=%s", pdb_id, list(data["pair_repr"].shape))
+                    return True
+                elif isinstance(data, torch.Tensor) and data.dim() >= 3:
+                    torch.save({"pair_repr": data}, pair_file)
+                    logger.info("  %s: OK zij=%s", pdb_id, list(data.shape))
+                    return True
 
-        if zij_path is None:
-            # Try reading from CIF output
-            for p in output_dir.rglob(f"*{pdb_id}*"):
-                if p.is_dir():
-                    for f in p.rglob("*.pt"):
-                        data = torch.load(f, map_location="cpu", weights_only=False)
-                        if isinstance(data, dict) and "pair_repr" in data:
-                            torch.save(
-                                {"pair_repr": data["pair_repr"]}, pair_file
-                            )
-                            logger.info(
-                                "  %s: OK zij=%s",
-                                pdb_id,
-                                list(data["pair_repr"].shape),
-                            )
-                            return True
-
-            logger.warning("  %s: no pair repr found in output", pdb_id)
-            return False
-
-        zij = torch.load(zij_path, map_location="cpu", weights_only=False)
-        if isinstance(zij, dict):
-            zij = zij.get("pair_repr", zij.get("zij", list(zij.values())[0]))
-        torch.save({"pair_repr": zij}, pair_file)
-        logger.info("  %s: OK zij=%s", pdb_id, list(zij.shape))
-        return True
+        logger.warning("  %s: no pair repr found in output", pdb_id)
+        return False
 
     except Exception as e:
         logger.error("  %s: FAILED — %s", pdb_id, e)
         return False
     finally:
-        # Cleanup MSA cache
         if msa_dir.exists():
             shutil.rmtree(msa_dir, ignore_errors=True)
 
@@ -198,7 +186,7 @@ def download_coords(pdb_id: str, coords_dir: Path) -> bool:
                 ca_coords.append(res["CA"].get_vector().get_array())
 
         if not ca_coords:
-            logger.warning("  %s: no Cα atoms found", pdb_id)
+            logger.warning("  %s: no Ca atoms found", pdb_id)
             return False
 
         coords = torch.tensor(np.array(ca_coords), dtype=torch.float32)
@@ -210,132 +198,205 @@ def download_coords(pdb_id: str, coords_dir: Path) -> bool:
         return False
 
 
-def process_chunk(
-    chunk_idx: int,
+# ── Shard packing ────────────────────────────────────────────────
+
+def pack_shard(
+    shard_idx: int,
+    pdb_ids: list[str],
+    pair_repr_dir: Path,
+    coords_dir: Path,
+    shard_dir: Path,
+) -> tuple[Path, int]:
+    """Pack completed .pt files into one .npz shard. Returns (path, ok_count)."""
+    shard_path = shard_dir / f"shard_{shard_idx:04d}.npz"
+
+    valid_ids = []
+    arrays: dict = {}
+
+    for pdb_id in pdb_ids:
+        pr_file = pair_repr_dir / f"{pdb_id}_pair_repr.pt"
+        ca_file = coords_dir / f"{pdb_id}_ca.pt"
+        if not pr_file.exists() or not ca_file.exists():
+            continue
+
+        try:
+            pr_data = torch.load(pr_file, map_location="cpu", weights_only=False)
+            pair_repr = pr_data if isinstance(pr_data, torch.Tensor) else pr_data["pair_repr"]
+            if pair_repr.dim() == 4:
+                pair_repr = pair_repr.squeeze(0)
+
+            coords = torch.load(ca_file, map_location="cpu", weights_only=True)
+
+            idx = len(valid_ids)
+            arrays[f"pair_repr_{idx}"] = pair_repr.numpy()
+            arrays[f"coords_ca_{idx}"] = coords.numpy()
+            valid_ids.append(pdb_id)
+
+        except Exception as e:
+            logger.warning("  %s: skip packing — %s", pdb_id, e)
+
+    if not valid_ids:
+        logger.warning("  Shard %04d: no valid proteins, skipping", shard_idx)
+        return shard_path, 0
+
+    arrays["pdb_ids"] = np.array(valid_ids, dtype=object)
+    np.savez_compressed(shard_path, **arrays)
+
+    size_mb = shard_path.stat().st_size / (1024 * 1024)
+    logger.info(
+        "  Shard %04d: %d proteins, %.1f MB",
+        shard_idx, len(valid_ids), size_mb,
+    )
+    return shard_path, len(valid_ids)
+
+
+def cleanup_pt_files(pdb_ids: list[str], pair_repr_dir: Path, coords_dir: Path):
+    """Delete .pt files after shard packing to free disk."""
+    for pdb_id in pdb_ids:
+        (pair_repr_dir / f"{pdb_id}_pair_repr.pt").unlink(missing_ok=True)
+        (coords_dir / f"{pdb_id}_ca.pt").unlink(missing_ok=True)
+
+
+# ── Main pipeline ────────────────────────────────────────────────
+
+def process_shard_group(
+    shard_idx: int,
     proteins: list[dict],
     query_dir: Path,
     output_dir: Path,
     pair_repr_dir: Path,
     coords_dir: Path,
+    shard_dir: Path,
     progress_dir: Path,
     InferenceExperimentConfig,
     run_inference,
+    inference_chunk_size: int = 10,
 ) -> tuple[int, int]:
-    """Process a chunk of proteins. Returns (success_count, total_count)."""
-    marker = progress_dir / f"chunk_{chunk_idx:04d}.ok"
-    if marker.exists():
-        logger.info("Chunk %d: already completed, skipping", chunk_idx)
-        return len(proteins), len(proteins)
+    """Process a shard group: inference → pack → cleanup.
+
+    Returns (success_count, total_count).
+    """
+    marker = progress_dir / f"shard_{shard_idx:04d}.ok"
+    shard_path = shard_dir / f"shard_{shard_idx:04d}.npz"
+
+    if marker.exists() and shard_path.exists():
+        info = json.loads(marker.read_text())
+        logger.info(
+            "Shard %04d: already completed (%d/%d), skipping",
+            shard_idx, info["success"], info["total"],
+        )
+        return info["success"], info["total"]
 
     logger.info(
-        "=== Chunk %d: %d proteins (%s ... %s) ===",
-        chunk_idx,
-        len(proteins),
-        proteins[0]["pdb_id"],
-        proteins[-1]["pdb_id"],
+        "\n{'='*60}\n  Shard %04d: %d proteins (%s ... %s)\n{'='*60}",
+        shard_idx, len(proteins),
+        proteins[0]["pdb_id"], proteins[-1]["pdb_id"],
     )
 
-    success = 0
+    # Step 1: Run inference + download coords (in sub-chunks of 10)
+    success_ids = []
     failed_ids = []
 
+    for i in range(0, len(proteins), inference_chunk_size):
+        sub_chunk = proteins[i : i + inference_chunk_size]
+        for p in sub_chunk:
+            pdb_id = p["pdb_id"]
+            sequence = p["sequence"]
+
+            ok = run_single_protein(
+                pdb_id, sequence, query_dir, output_dir, pair_repr_dir,
+                InferenceExperimentConfig, run_inference,
+            )
+
+            if ok:
+                ok = download_coords(pdb_id, coords_dir)
+
+            if ok:
+                success_ids.append(pdb_id)
+            else:
+                failed_ids.append(pdb_id)
+
+        # GPU cleanup between sub-chunks
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Step 2: Pack into .npz shard
+    all_ids = [p["pdb_id"] for p in proteins]
+    _, n_packed = pack_shard(shard_idx, all_ids, pair_repr_dir, coords_dir, shard_dir)
+
+    # Step 3: Delete .pt files to free disk
+    cleanup_pt_files(all_ids, pair_repr_dir, coords_dir)
+
+    # Clean OF3 output for these proteins
     for p in proteins:
-        pdb_id = p["pdb_id"]
-        sequence = p["sequence"]
-
-        # Extract pair representation
-        ok = run_single_protein(
-            pdb_id,
-            sequence,
-            query_dir,
-            output_dir,
-            pair_repr_dir,
-            InferenceExperimentConfig,
-            run_inference,
-        )
-
-        # Download coordinates
-        if ok:
-            ok = download_coords(pdb_id, coords_dir)
-
-        if ok:
-            success += 1
-        else:
-            failed_ids.append(pdb_id)
-
-    # GPU cache cleanup
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        pdb_dir = output_dir / p["pdb_id"]
+        if pdb_dir.exists():
+            shutil.rmtree(pdb_dir, ignore_errors=True)
+        # Also check for directories containing the PDB ID
+        for d in output_dir.glob(f"*{p['pdb_id']}*"):
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
 
     # Write marker
     marker.write_text(
-        json.dumps(
-            {
-                "success": success,
-                "total": len(proteins),
-                "failed": failed_ids,
-            }
-        )
+        json.dumps({
+            "success": len(success_ids),
+            "total": len(proteins),
+            "packed": n_packed,
+            "failed": failed_ids,
+        })
     )
 
     logger.info(
-        "Chunk %d: %d/%d OK, failed: %s",
-        chunk_idx,
-        success,
-        len(proteins),
-        failed_ids or "none",
+        "Shard %04d done: %d/%d extracted, %d packed, failed: %s",
+        shard_idx, len(success_ids), len(proteins),
+        n_packed, failed_ids or "none",
     )
 
-    return success, len(proteins)
+    return len(success_ids), len(proteins)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Chunked OpenFold3 inference for pair representation extraction"
+        description="Chunked OpenFold3 inference + inline shard packing"
     )
     parser.add_argument(
-        "--pdb-list",
-        type=str,
-        default="data/pdb_2000.json",
+        "--pdb-list", type=str, default="data/pdb_2000.json",
         help="Path to curated PDB list JSON",
     )
     parser.add_argument(
-        "--chunk-size", type=int, default=10, help="Proteins per chunk"
+        "--shard-size", type=int, default=50,
+        help="Proteins per .npz shard (default 50)",
     )
     parser.add_argument(
-        "--start", type=int, default=0, help="Start index (protein number)"
+        "--inference-chunk-size", type=int, default=10,
+        help="Proteins per inference sub-chunk (default 10)",
+    )
+    parser.add_argument("--start", type=int, default=0, help="Start protein index")
+    parser.add_argument("--end", type=int, default=-1, help="End index (-1 = all)")
+    parser.add_argument(
+        "--pair-repr-dir", type=str, default="/content/pair_reprs",
+        help="Temp dir for pair repr .pt files",
     )
     parser.add_argument(
-        "--end", type=int, default=-1, help="End index (-1 = all)"
+        "--coords-dir", type=str, default="/content/coords",
+        help="Temp dir for coord .pt files",
     )
     parser.add_argument(
-        "--pair-repr-dir",
-        type=str,
-        default="/content/pair_reprs",
-        help="Directory for pair representation .pt files",
+        "--output-dir", type=str, default="/content/of3_output",
+        help="OpenFold3 raw output dir",
     )
     parser.add_argument(
-        "--coords-dir",
-        type=str,
-        default="/content/coords",
-        help="Directory for Cα coordinate .pt files",
+        "--query-dir", type=str, default="/content/queries",
+        help="Dir for query JSON files",
     )
     parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="/content/of3_output",
-        help="OpenFold3 raw output directory",
+        "--shard-dir", type=str, default="data/shards",
+        help="Output dir for .npz shards",
     )
     parser.add_argument(
-        "--query-dir",
-        type=str,
-        default="/content/queries",
-        help="Directory for query JSON files",
-    )
-    parser.add_argument(
-        "--progress-dir",
-        type=str,
-        default="data/progress",
-        help="Directory for chunk completion markers",
+        "--progress-dir", type=str, default="data/progress",
+        help="Dir for completion markers",
     )
     args = parser.parse_args()
 
@@ -350,45 +411,45 @@ def main():
     proteins = proteins[args.start : end]
     logger.info(
         "Processing proteins %d–%d (%d total)",
-        args.start,
-        args.start + len(proteins),
-        len(proteins),
+        args.start, args.start + len(proteins), len(proteins),
     )
 
-    # Create directories
-    pair_repr_dir = Path(args.pair_repr_dir)
-    coords_dir = Path(args.coords_dir)
-    output_dir = Path(args.output_dir)
-    query_dir = Path(args.query_dir)
-    progress_dir = Path(args.progress_dir)
-
-    for d in [pair_repr_dir, coords_dir, output_dir, query_dir, progress_dir]:
+    # Create dirs
+    dirs = {
+        "pair_repr": Path(args.pair_repr_dir),
+        "coords": Path(args.coords_dir),
+        "output": Path(args.output_dir),
+        "query": Path(args.query_dir),
+        "shard": Path(args.shard_dir),
+        "progress": Path(args.progress_dir),
+    }
+    for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
 
     # Setup OpenFold3
     InferenceExperimentConfig, run_inference_fn = setup_openfold3()
 
-    # Process chunks
+    # Process shard groups
     total_success = 0
     total_processed = 0
-    failed_all = []
-
     t0 = time.time()
 
-    for i in range(0, len(proteins), args.chunk_size):
-        chunk = proteins[i : i + args.chunk_size]
-        chunk_idx = (args.start + i) // args.chunk_size
+    for i in range(0, len(proteins), args.shard_size):
+        group = proteins[i : i + args.shard_size]
+        shard_idx = (args.start + i) // args.shard_size
 
-        success, total = process_chunk(
-            chunk_idx=chunk_idx,
-            proteins=chunk,
-            query_dir=query_dir,
-            output_dir=output_dir,
-            pair_repr_dir=pair_repr_dir,
-            coords_dir=coords_dir,
-            progress_dir=progress_dir,
+        success, total = process_shard_group(
+            shard_idx=shard_idx,
+            proteins=group,
+            query_dir=dirs["query"],
+            output_dir=dirs["output"],
+            pair_repr_dir=dirs["pair_repr"],
+            coords_dir=dirs["coords"],
+            shard_dir=dirs["shard"],
+            progress_dir=dirs["progress"],
             InferenceExperimentConfig=InferenceExperimentConfig,
             run_inference=run_inference_fn,
+            inference_chunk_size=args.inference_chunk_size,
         )
 
         total_success += success
@@ -398,34 +459,37 @@ def main():
         rate = total_processed / elapsed if elapsed > 0 else 0
         eta = (len(proteins) - total_processed) / rate if rate > 0 else 0
         logger.info(
-            "Progress: %d/%d success (%.1f%%), %.1f prot/min, ETA %.0f min",
-            total_success,
-            total_processed,
+            "Overall: %d/%d success (%.1f%%), %.1f prot/min, ETA %.0f min",
+            total_success, total_processed,
             100 * total_success / max(total_processed, 1),
-            rate * 60,
-            eta / 60,
+            rate * 60, eta / 60,
         )
 
-    # Save failed list
-    failed_path = Path("data/failed_pdbs.json")
-    marker_files = sorted(progress_dir.glob("chunk_*.ok"))
-    for mf in marker_files:
+    # Collect failed list
+    failed_all = []
+    for mf in sorted(dirs["progress"].glob("shard_*.ok")):
         info = json.loads(mf.read_text())
         failed_all.extend(info.get("failed", []))
 
+    failed_path = Path("data/failed_pdbs.json")
+    failed_path.parent.mkdir(parents=True, exist_ok=True)
     failed_path.write_text(json.dumps(failed_all, indent=2))
+
+    # Shard stats
+    shard_files = sorted(dirs["shard"].glob("shard_*.npz"))
+    total_size_mb = sum(f.stat().st_size for f in shard_files) / (1024 * 1024)
 
     elapsed = time.time() - t0
     logger.info(
         "\n=== DONE ===\n"
-        "  Total: %d/%d extracted (%.1f%%)\n"
-        "  Failed: %d proteins (saved to %s)\n"
+        "  Extracted: %d/%d (%.1f%%)\n"
+        "  Shards: %d files (%.1f MB total)\n"
+        "  Failed: %d (saved to %s)\n"
         "  Time: %.1f min",
-        total_success,
-        total_processed,
+        total_success, total_processed,
         100 * total_success / max(total_processed, 1),
-        len(failed_all),
-        failed_path,
+        len(shard_files), total_size_mb,
+        len(failed_all), failed_path,
         elapsed / 60,
     )
 
