@@ -1,12 +1,16 @@
 """Dataset utilities: PDB → Cα coordinates + OpenFold3 features."""
 
+import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 from .ground_truth import compute_gt_probability_matrix
+
+logger = logging.getLogger(__name__)
 
 
 def extract_ca_coords(pdb_path: str | Path) -> torch.Tensor:
@@ -93,3 +97,89 @@ class ProteinContactDataset(Dataset):
                 )
 
         return item
+
+
+class ShardedPairReprDataset(Dataset):
+    """Dataset that lazily loads .npz shards containing pair representations.
+
+    Each shard contains multiple proteins with variable-size tensors.
+    Shards are loaded on demand and cached in memory (one shard at a time).
+
+    Shard format:
+        pdb_ids: list of PDB identifiers
+        pair_repr_{i}: [N_i, N_i, c_z] pair representation for protein i
+        coords_ca_{i}: [N_i, 3] Cα coordinates for protein i
+    """
+
+    def __init__(
+        self,
+        shard_paths: List[Path],
+        r_cut: float = 8.0,
+        tau: float = 1.0,
+    ) -> None:
+        self.shard_paths = sorted(shard_paths)
+        self.r_cut = r_cut
+        self.tau = tau
+
+        # Build index: (shard_idx, protein_idx_within_shard)
+        self._index: List[tuple[int, int]] = []
+        self._shard_sizes: List[int] = []
+
+        for shard_idx, sp in enumerate(self.shard_paths):
+            with np.load(sp, allow_pickle=True) as data:
+                pdb_ids = data["pdb_ids"]
+                n = len(pdb_ids)
+            self._shard_sizes.append(n)
+            for j in range(n):
+                self._index.append((shard_idx, j))
+
+        # Shard cache (keep one loaded at a time)
+        self._cached_shard_idx: int = -1
+        self._cached_data: Optional[dict] = None
+
+        logger.info(
+            "ShardedDataset: %d proteins across %d shards",
+            len(self._index),
+            len(self.shard_paths),
+        )
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def _load_shard(self, shard_idx: int) -> dict:
+        if shard_idx == self._cached_shard_idx and self._cached_data is not None:
+            return self._cached_data
+        data = dict(np.load(self.shard_paths[shard_idx], allow_pickle=True))
+        self._cached_shard_idx = shard_idx
+        self._cached_data = data
+        return data
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        shard_idx, protein_idx = self._index[idx]
+        data = self._load_shard(shard_idx)
+
+        pdb_id = str(data["pdb_ids"][protein_idx])
+        pair_repr = torch.from_numpy(
+            data[f"pair_repr_{protein_idx}"]
+        ).float()
+        coords_ca = torch.from_numpy(
+            data[f"coords_ca_{protein_idx}"]
+        ).float()
+
+        c_gt = compute_gt_probability_matrix(
+            coords_ca, r_cut=self.r_cut, tau=self.tau
+        )
+
+        # Align sizes (n_token may differ from n_ca)
+        n_tok = pair_repr.shape[0]
+        n_ca = coords_ca.shape[0]
+        n = min(n_tok, n_ca)
+
+        pair_repr = pair_repr[:n, :n, :]
+        c_gt = c_gt[:n, :n]
+
+        return {
+            "pair_repr": pair_repr.unsqueeze(0),  # [1, N, N, c_z]
+            "c_gt": c_gt.unsqueeze(0),             # [1, N, N]
+            "pdb_id": pdb_id,
+        }

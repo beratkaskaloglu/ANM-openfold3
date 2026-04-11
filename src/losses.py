@@ -8,6 +8,53 @@ import torch.nn.functional as F
 from .kirchhoff import gnm_decompose, soft_kirchhoff
 
 
+def focal_loss(
+    c_pred: torch.Tensor,
+    c_gt: torch.Tensor,
+    seq_sep_min: int = 6,
+    focal_gamma: float = 2.0,
+    focal_alpha: float = 0.75,
+) -> torch.Tensor:
+    """Focal loss with sequence-separation filter.
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    Down-weights easy examples and focuses on hard boundary cases.
+    Better than BCE for imbalanced contact maps (~10% positive).
+
+    Args:
+        c_pred: [B, N, N] or [N, N] predicted probabilities.
+        c_gt:   same shape, ground-truth soft contacts.
+        seq_sep_min: minimum sequence separation.
+        focal_gamma: focusing parameter (higher = more focus on hard examples).
+        focal_alpha: balance weight for positive class.
+
+    Returns:
+        Scalar loss.
+    """
+    n = c_pred.shape[-1]
+    idx = torch.arange(n, device=c_pred.device)
+    sep_mask = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs() >= seq_sep_min
+
+    pred_masked = c_pred[..., sep_mask].clamp(1e-7, 1.0 - 1e-7)
+    gt_masked = c_gt[..., sep_mask]
+
+    # Per-element BCE (no reduction)
+    bce = F.binary_cross_entropy(pred_masked, gt_masked, reduction="none")
+
+    # p_t = p if y=1, else 1-p
+    p_t = pred_masked * gt_masked + (1.0 - pred_masked) * (1.0 - gt_masked)
+
+    # Alpha weighting: alpha for positives, (1-alpha) for negatives
+    alpha_t = focal_alpha * gt_masked + (1.0 - focal_alpha) * (1.0 - gt_masked)
+
+    # Focal modulation
+    focal_weight = alpha_t * (1.0 - p_t) ** focal_gamma
+
+    loss = (focal_weight * bce).mean()
+    return loss
+
+
 def contact_loss(
     c_pred: torch.Tensor,
     c_gt: torch.Tensor,
@@ -119,6 +166,9 @@ def total_loss(
     beta: float = 0.5,
     gamma: float = 0.1,
     n_modes: int = 20,
+    use_focal: bool = False,
+    focal_gamma: float = 2.0,
+    focal_alpha: float = 0.75,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Combined loss: L = α·L_contact + β·L_gnm + γ·L_recon.
 
@@ -131,11 +181,19 @@ def total_loss(
         beta:   GNM-loss weight.
         gamma:  reconstruction-loss weight.
         n_modes: modes for GNM loss.
+        use_focal: use focal loss instead of BCE.
+        focal_gamma: focal loss focusing parameter.
+        focal_alpha: focal loss balance weight.
 
     Returns:
         (scalar loss, dict of all component values)
     """
-    l_contact = contact_loss(c_pred, c_gt)
+    if use_focal:
+        l_contact = focal_loss(
+            c_pred, c_gt, focal_gamma=focal_gamma, focal_alpha=focal_alpha
+        )
+    else:
+        l_contact = contact_loss(c_pred, c_gt)
     l_gnm, gnm_details = gnm_loss(c_pred, c_gt, n_modes=n_modes)
 
     loss = alpha * l_contact + beta * l_gnm
