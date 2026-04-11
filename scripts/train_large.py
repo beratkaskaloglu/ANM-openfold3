@@ -390,8 +390,8 @@ def main():
         len(test_ds),
     )
 
-    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=1)
+    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
 
     # Model
     head = ContactProjectionHead(c_z=cfg.c_z, bottleneck_dim=cfg.bottleneck_dim)
@@ -505,6 +505,11 @@ def main():
         if wandb_run is not None:
             wandb_run.log(record)
 
+        # NaN guard
+        if torch.isnan(torch.tensor(val_metrics["loss"])):
+            logger.warning("Epoch %d: val_loss is NaN, skipping checkpoint", epoch + 1)
+            continue
+
         # Best model
         if val_metrics["loss"] < best_val_loss - cfg.min_delta:
             best_val_loss = val_metrics["loss"]
@@ -550,62 +555,81 @@ def main():
 
     # Final test evaluation
     logger.info("\n" + "=" * 60)
-    logger.info("Final evaluation on test set...")
 
-    # Load best model
-    best_ckpt = torch.load(
-        ckpt_dir / "best_model.pt", map_location=cfg.device, weights_only=False
-    )
-    head.load_state_dict(best_ckpt["model_state_dict"])
+    best_model_path = ckpt_dir / "best_model.pt"
+    if best_model_path.exists():
+        logger.info("Final evaluation on test set...")
 
-    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=1)
-    test_metrics = validate(head, test_loader, cfg)
+        best_ckpt = torch.load(
+            best_model_path, map_location=cfg.device, weights_only=False
+        )
+        head.load_state_dict(best_ckpt["model_state_dict"])
 
-    logger.info(
-        "TEST RESULTS:\n"
-        "  loss=%.4f\n"
-        "  adj_acc=%.4f\n"
-        "  bf_pearson=%.4f\n"
-        "  L_contact=%.4f\n"
-        "  L_gnm=%.4f",
-        test_metrics["loss"],
-        test_metrics.get("adj_acc", 0),
-        test_metrics.get("bf_pearson", 0),
-        test_metrics.get("L_contact", 0),
-        test_metrics.get("L_gnm", 0),
-    )
+        test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=0)
+        test_metrics = validate(head, test_loader, cfg)
 
-    # Save test results
-    test_results = {
-        "test_metrics": test_metrics,
-        "best_epoch": best_ckpt["epoch"] + 1,
-        "best_val_loss": best_ckpt["val_loss"],
-        "total_epochs": epoch + 1,
-        "total_time_min": total_time / 60,
-        "config": asdict(cfg),
-    }
-    (ckpt_dir / "test_results.json").write_text(json.dumps(test_results, indent=2))
+        logger.info(
+            "TEST RESULTS:\n"
+            "  loss=%.4f\n"
+            "  adj_acc=%.4f\n"
+            "  bf_pearson=%.4f\n"
+            "  L_contact=%.4f\n"
+            "  L_gnm=%.4f",
+            test_metrics["loss"],
+            test_metrics.get("adj_acc", 0),
+            test_metrics.get("bf_pearson", 0),
+            test_metrics.get("L_contact", 0),
+            test_metrics.get("L_gnm", 0),
+        )
 
-    logger.info(
-        "\n=== DONE ===\n"
-        "  Best epoch: %d\n"
-        "  Best val_loss: %.4f\n"
-        "  Test adj_acc: %.4f\n"
-        "  Test bf_pearson: %.4f\n"
-        "  Total time: %.1f min\n"
-        "  Checkpoints: %s",
-        best_ckpt["epoch"] + 1,
-        best_ckpt["val_loss"],
-        test_metrics.get("adj_acc", 0),
-        test_metrics.get("bf_pearson", 0),
-        total_time / 60,
-        ckpt_dir,
-    )
+        test_results = {
+            "test_metrics": test_metrics,
+            "best_epoch": best_ckpt["epoch"] + 1,
+            "best_val_loss": best_ckpt["val_loss"],
+            "total_epochs": epoch + 1,
+            "total_time_min": total_time / 60,
+            "config": asdict(cfg),
+        }
+        (ckpt_dir / "test_results.json").write_text(json.dumps(test_results, indent=2))
+
+        logger.info(
+            "\n=== DONE ===\n"
+            "  Best epoch: %d\n"
+            "  Best val_loss: %.4f\n"
+            "  Test adj_acc: %.4f\n"
+            "  Test bf_pearson: %.4f\n"
+            "  Total time: %.1f min\n"
+            "  Checkpoints: %s",
+            best_ckpt["epoch"] + 1,
+            best_ckpt["val_loss"],
+            test_metrics.get("adj_acc", 0),
+            test_metrics.get("bf_pearson", 0),
+            total_time / 60,
+            ckpt_dir,
+        )
+    else:
+        logger.warning(
+            "best_model.pt not found (val_loss may have been NaN). "
+            "Skipping test evaluation. latest.pt still saved."
+        )
+        logger.info(
+            "\n=== DONE (no best model) ===\n"
+            "  Total epochs: %d\n"
+            "  Total time: %.1f min\n"
+            "  Checkpoints: %s",
+            epoch + 1,
+            total_time / 60,
+            ckpt_dir,
+        )
 
     if wandb_run is not None:
-        wandb_run.log({"test": test_metrics})
+        wandb_run.log({"test": test_metrics} if best_model_path.exists() else {})
         wandb_run.finish()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logger.exception("Training crashed with exception:")
+        sys.exit(1)
