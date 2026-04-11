@@ -46,17 +46,17 @@ logger = logging.getLogger(__name__)
 # ── OpenFold3 setup ──────────────────────────────────────────────
 
 def setup_openfold3():
-    """Import and configure OpenFold3 for inference."""
+    """Import OpenFold3 classes for inference."""
     try:
-        from openfold3.entry_points.inference import (
-            InferenceExperimentConfig,
-            run_inference,
+        from openfold3.entry_points.validator import InferenceExperimentConfig
+        from openfold3.entry_points.experiment_runner import InferenceExperimentRunner
+        from openfold3.projects.of3_all_atom.config.inference_query_format import (
+            InferenceQuerySet,
         )
-        return InferenceExperimentConfig, run_inference
-    except ImportError:
-        logger.error(
-            "OpenFold3 not found. Ensure openfold3-repo is in sys.path or installed."
-        )
+        return InferenceExperimentConfig, InferenceExperimentRunner, InferenceQuerySet
+    except ImportError as e:
+        logger.error("OpenFold3 import failed: %s", e)
+        logger.error("Ensure openfold3-repo is installed: pip install -e openfold3-repo")
         sys.exit(1)
 
 
@@ -89,7 +89,8 @@ def run_single_protein(
     output_dir: Path,
     pair_repr_dir: Path,
     InferenceExperimentConfig,
-    run_inference,
+    InferenceExperimentRunner,
+    InferenceQuerySet,
 ) -> bool:
     """Run OpenFold3 inference for one protein and save pair repr .pt."""
     pair_file = pair_repr_dir / f"{pdb_id}_pair_repr.pt"
@@ -102,6 +103,7 @@ def run_single_protein(
         shutil.rmtree(msa_dir, ignore_errors=True)
     msa_dir.mkdir(parents=True, exist_ok=True)
 
+    runner = None
     try:
         query_file = write_query_json(pdb_id, sequence, query_dir)
 
@@ -132,28 +134,41 @@ def run_single_protein(
             },
         )
 
-        run_inference(
-            queries_json=str(query_file),
-            output_dir=str(output_dir),
-            experiment_config=config,
+        out_dir = output_dir / pdb_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        runner = InferenceExperimentRunner(
+            config,
+            num_diffusion_samples=1,
+            num_model_seeds=1,
+            use_msa_server=True,
+            use_templates=False,
+            output_dir=out_dir,
         )
 
-        # Find pair representation in output
-        for pattern in [
-            f"*{pdb_id}*/**/zij_trunk*.pt",
-            f"*{pdb_id}*/**/*latent*.pt",
-            f"*{pdb_id}*/**/*.pt",
-        ]:
-            for p in output_dir.rglob(pattern):
-                data = torch.load(p, map_location="cpu", weights_only=False)
-                if isinstance(data, dict) and "pair_repr" in data:
-                    torch.save({"pair_repr": data["pair_repr"]}, pair_file)
-                    logger.info("  %s: OK zij=%s", pdb_id, list(data["pair_repr"].shape))
-                    return True
-                elif isinstance(data, torch.Tensor) and data.dim() >= 3:
-                    torch.save({"pair_repr": data}, pair_file)
-                    logger.info("  %s: OK zij=%s", pdb_id, list(data.shape))
-                    return True
+        query_set = InferenceQuerySet.from_json(str(query_file))
+        runner.setup()
+        runner.run(query_set)
+
+        # Find latent output with pair representation
+        latent_files = list(out_dir.rglob("*_latent_output.pt"))
+        if latent_files:
+            latent = torch.load(latent_files[0], map_location="cpu", weights_only=False)
+            zij = latent.get("pair_repr", latent.get("zij_trunk"))
+            if zij is not None:
+                torch.save({"pair_repr": zij}, pair_file)
+                logger.info("  %s: OK zij=%s", pdb_id, list(zij.shape))
+                return True
+
+        # Fallback: search all .pt files
+        for pt_file in out_dir.rglob("*.pt"):
+            data = torch.load(pt_file, map_location="cpu", weights_only=False)
+            if isinstance(data, dict):
+                for key in ["pair_repr", "zij_trunk", "zij"]:
+                    if key in data:
+                        torch.save({"pair_repr": data[key]}, pair_file)
+                        logger.info("  %s: OK zij=%s", pdb_id, list(data[key].shape))
+                        return True
 
         logger.warning("  %s: no pair repr found in output", pdb_id)
         return False
@@ -164,6 +179,11 @@ def run_single_protein(
     finally:
         if msa_dir.exists():
             shutil.rmtree(msa_dir, ignore_errors=True)
+        if runner is not None:
+            try:
+                runner.cleanup()
+            except Exception:
+                pass
 
 
 def download_coords(pdb_id: str, coords_dir: Path) -> bool:
@@ -276,7 +296,8 @@ def process_shard_group(
     shard_dir: Path,
     progress_dir: Path,
     InferenceExperimentConfig,
-    run_inference,
+    InferenceExperimentRunner,
+    InferenceQuerySet,
     inference_chunk_size: int = 10,
 ) -> tuple[int, int]:
     """Process a shard group: inference → pack → cleanup.
@@ -295,7 +316,9 @@ def process_shard_group(
         return info["success"], info["total"]
 
     logger.info(
-        "\n{'='*60}\n  Shard %04d: %d proteins (%s ... %s)\n{'='*60}",
+        "============================================================\n"
+        "  Shard %04d: %d proteins (%s ... %s)\n"
+        "============================================================",
         shard_idx, len(proteins),
         proteins[0]["pdb_id"], proteins[-1]["pdb_id"],
     )
@@ -312,7 +335,8 @@ def process_shard_group(
 
             ok = run_single_protein(
                 pdb_id, sequence, query_dir, output_dir, pair_repr_dir,
-                InferenceExperimentConfig, run_inference,
+                InferenceExperimentConfig, InferenceExperimentRunner,
+                InferenceQuerySet,
             )
 
             if ok:
@@ -434,7 +458,9 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     # Setup OpenFold3
-    InferenceExperimentConfig, run_inference_fn = setup_openfold3()
+    InferenceExperimentConfig, InferenceExperimentRunner, InferenceQuerySet = (
+        setup_openfold3()
+    )
 
     # Process shard groups
     total_success = 0
@@ -455,7 +481,8 @@ def main():
             shard_dir=dirs["shard"],
             progress_dir=dirs["progress"],
             InferenceExperimentConfig=InferenceExperimentConfig,
-            run_inference=run_inference_fn,
+            InferenceExperimentRunner=InferenceExperimentRunner,
+            InferenceQuerySet=InferenceQuerySet,
             inference_chunk_size=args.inference_chunk_size,
         )
 
