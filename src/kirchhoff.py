@@ -52,7 +52,10 @@ def gnm_decompose(
         eigenvectors: [N, n_modes] corresponding eigenvectors.
         b_factors:    [N]          B_i = Σ_k (V_ik² / λ_k).
     """
-    vals, vecs = torch.linalg.eigh(gamma)  # ascending order
+    # Run eigh on CPU to avoid CUSOLVER_STATUS_INTERNAL_ERROR on some GPUs
+    device = gamma.device
+    vals, vecs = torch.linalg.eigh(gamma.cpu())
+    vals, vecs = vals.to(device), vecs.to(device)
 
     # Clamp n_modes to available non-trivial modes
     max_modes = vals.shape[-1] - 1
