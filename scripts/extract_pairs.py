@@ -23,6 +23,13 @@ import sys
 import time
 from pathlib import Path
 
+# Ensure openfold3 and src/ are importable when run as subprocess
+_script_dir = Path(__file__).resolve().parent.parent
+_of3_dir = _script_dir / "openfold3-repo"
+for _p in [str(_script_dir), str(_of3_dir)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import numpy as np
 import torch
 
