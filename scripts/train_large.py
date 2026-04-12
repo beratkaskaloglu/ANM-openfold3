@@ -423,13 +423,11 @@ def main():
     if args.resume:
         ckpt = torch.load(args.resume, map_location=cfg.device, weights_only=False)
         head.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        start_epoch = ckpt["epoch"] + 1
+        # Don't restore optimizer/scheduler — fresh training run on new data
         best_val_loss = ckpt.get("val_loss", float("inf"))
         logger.info(
-            "Resumed from epoch %d (val_loss=%.4f)", start_epoch, best_val_loss
+            "Resumed model weights (prev val_loss=%.4f), training %d fresh epochs",
+            best_val_loss, cfg.epochs,
         )
 
     # WandB
