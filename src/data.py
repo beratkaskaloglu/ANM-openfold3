@@ -179,7 +179,7 @@ class ShardedPairReprDataset(Dataset):
         c_gt = c_gt[:n, :n]
 
         return {
-            "pair_repr": pair_repr.unsqueeze(0),  # [1, N, N, c_z]
-            "c_gt": c_gt.unsqueeze(0),             # [1, N, N]
+            "pair_repr": pair_repr,   # [N, N, c_z] — DataLoader adds batch dim
+            "c_gt": c_gt,             # [N, N]
             "pdb_id": pdb_id,
         }
