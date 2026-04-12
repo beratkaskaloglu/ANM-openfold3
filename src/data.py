@@ -139,12 +139,13 @@ class ShardedPairReprDataset(Dataset):
             for j in range(n):
                 self._index.append((shard_idx, j))
 
-        # Shard cache (keep one loaded at a time)
-        self._cached_shard_idx: int = -1
-        self._cached_data: Optional[dict] = None
+        # Pre-load ALL shards into memory (avoids disk re-reads during training)
+        self._all_data: List[dict] = []
+        for sp in self.shard_paths:
+            self._all_data.append(dict(np.load(sp, allow_pickle=True)))
 
         logger.info(
-            "ShardedDataset: %d proteins across %d shards",
+            "ShardedDataset: %d proteins across %d shards (all in memory)",
             len(self._index),
             len(self.shard_paths),
         )
@@ -153,12 +154,7 @@ class ShardedPairReprDataset(Dataset):
         return len(self._index)
 
     def _load_shard(self, shard_idx: int) -> dict:
-        if shard_idx == self._cached_shard_idx and self._cached_data is not None:
-            return self._cached_data
-        data = dict(np.load(self.shard_paths[shard_idx], allow_pickle=True))
-        self._cached_shard_idx = shard_idx
-        self._cached_data = data
-        return data
+        return self._all_data[shard_idx]
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         shard_idx, protein_idx = self._index[idx]
