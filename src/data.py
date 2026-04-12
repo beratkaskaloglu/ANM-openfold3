@@ -128,7 +128,13 @@ class ShardedPairReprDataset(Dataset):
         for shard_idx, sp in enumerate(self.shard_paths):
             with np.load(sp, allow_pickle=True) as data:
                 pdb_ids = data["pdb_ids"]
-                n = len(pdb_ids)
+                # Count actually available proteins (not just pdb_ids length)
+                n = 0
+                for j in range(len(pdb_ids)):
+                    if f"pair_repr_{j}" in data:
+                        n += 1
+                    else:
+                        break
             self._shard_sizes.append(n)
             for j in range(n):
                 self._index.append((shard_idx, j))
@@ -157,6 +163,12 @@ class ShardedPairReprDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         shard_idx, protein_idx = self._index[idx]
         data = self._load_shard(shard_idx)
+
+        # Guard against partial shards
+        pdb_ids = data["pdb_ids"]
+        if protein_idx >= len(pdb_ids) or f"pair_repr_{protein_idx}" not in data:
+            # Fallback to first valid protein in this shard
+            protein_idx = 0
 
         pdb_id = str(data["pdb_ids"][protein_idx])
         pair_repr = torch.from_numpy(
