@@ -459,7 +459,11 @@ def main():
 
     history: List[Dict[str, Any]] = []
     epochs_no_improve = 0
+    epoch = start_epoch  # default if loop doesn't run
     t0 = time.time()
+
+    if start_epoch >= cfg.epochs:
+        logger.info("Already trained %d epochs (max=%d), skipping.", start_epoch, cfg.epochs)
 
     for epoch in range(start_epoch, cfg.epochs):
         epoch_t0 = time.time()
