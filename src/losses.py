@@ -107,8 +107,13 @@ def gnm_loss(
     Returns:
         (scalar loss, dict of component values)
     """
-    gamma_pred = soft_kirchhoff(c_pred)
-    gamma_gt = soft_kirchhoff(c_gt)
+    # Run entire GNM pipeline on CPU to avoid CUDA assert errors
+    device = c_pred.device
+    c_pred_cpu = c_pred.detach().cpu()
+    c_gt_cpu = c_gt.detach().cpu()
+
+    gamma_pred = soft_kirchhoff(c_pred_cpu)
+    gamma_gt = soft_kirchhoff(c_gt_cpu)
 
     vals_p, vecs_p, bf_p = gnm_decompose(gamma_pred, n_modes)
     vals_g, vecs_g, bf_g = gnm_decompose(gamma_gt, n_modes)
@@ -132,6 +137,7 @@ def gnm_loss(
     l_vec = (1.0 - cos_sim).mean()
 
     loss = w_eigenvalue * l_eig + w_bfactor * l_bf + w_eigvec * l_vec
+    loss = loss.to(device)
 
     details = {
         "L_eigenvalue": l_eig.item(),
