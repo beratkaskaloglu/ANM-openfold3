@@ -268,10 +268,13 @@ def pack_shard(
 
     arrays["pdb_ids"] = np.array(valid_ids, dtype=object)
 
-    # Atomic write: save to temp file first, then rename
-    tmp_path = shard_path.with_suffix('.npz.tmp')
-    np.savez_compressed(tmp_path, **arrays)
-    tmp_path.rename(shard_path)
+    # Atomic write: save to temp, then rename
+    # np.savez_compressed auto-appends .npz if missing, so we pass
+    # the path without extension and let it add .npz
+    tmp_stem = shard_path.parent / (shard_path.stem + '_tmp')
+    np.savez_compressed(tmp_stem, **arrays)  # creates {stem}_tmp.npz
+    tmp_file = tmp_stem.with_suffix('.npz')
+    tmp_file.rename(shard_path)
 
     size_mb = shard_path.stat().st_size / (1024 * 1024)
     logger.info(
