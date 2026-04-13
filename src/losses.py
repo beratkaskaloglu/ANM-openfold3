@@ -156,7 +156,9 @@ def gnm_loss(
             cpu_loss.backward()
             gnm_grad = c_pred_leaf.grad
         if gnm_grad is not None:
-            loss = (c_pred * gnm_grad.to(device).detach()).sum()
+            # Normalize gradient to unit norm → stable surrogate magnitude
+            gnm_grad_norm = gnm_grad / (gnm_grad.norm() + 1e-8)
+            loss = (c_pred * gnm_grad_norm.to(device).detach()).sum()
         else:
             loss = cpu_loss.detach().to(device)
     else:
