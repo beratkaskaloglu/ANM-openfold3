@@ -110,36 +110,39 @@ def gnm_loss(
         (scalar loss, dict of component values)
     """
     device = c_pred.device
+    grad_enabled = torch.is_grad_enabled()
 
     # --- Forward pass on CPU (avoids CUDA eigh errors) ---
-    c_pred_leaf = c_pred.detach().cpu().requires_grad_(True)
-    c_gt_cpu = c_gt.detach().cpu()
+    # Use enable_grad so this works even inside torch.no_grad() (validation)
+    with torch.enable_grad():
+        c_pred_leaf = c_pred.detach().cpu().requires_grad_(True)
+        c_gt_cpu = c_gt.detach().cpu()
 
-    gamma_pred = soft_kirchhoff(c_pred_leaf)
-    gamma_gt = soft_kirchhoff(c_gt_cpu)
+        gamma_pred = soft_kirchhoff(c_pred_leaf)
+        gamma_gt = soft_kirchhoff(c_gt_cpu)
 
-    vals_p, vecs_p, bf_p = gnm_decompose(gamma_pred, n_modes)
-    vals_g, vecs_g, bf_g = gnm_decompose(gamma_gt, n_modes)
+        vals_p, vecs_p, bf_p = gnm_decompose(gamma_pred, n_modes)
+        vals_g, vecs_g, bf_g = gnm_decompose(gamma_gt, n_modes)
 
-    # --- L_eigenvalue: MSE on normalised inverse eigenvalues ---
-    inv_p = 1.0 / (vals_p + 1e-10)
-    inv_g = 1.0 / (vals_g + 1e-10)
-    inv_p_norm = inv_p / (inv_p.sum() + 1e-10)
-    inv_g_norm = inv_g / (inv_g.sum() + 1e-10)
-    l_eig = F.mse_loss(inv_p_norm, inv_g_norm)
+        # --- L_eigenvalue: MSE on normalised inverse eigenvalues ---
+        inv_p = 1.0 / (vals_p + 1e-10)
+        inv_g = 1.0 / (vals_g + 1e-10)
+        inv_p_norm = inv_p / (inv_p.sum() + 1e-10)
+        inv_g_norm = inv_g / (inv_g.sum() + 1e-10)
+        l_eig = F.mse_loss(inv_p_norm, inv_g_norm)
 
-    # --- L_bfactor: MSE on normalised B-factor profiles ---
-    bf_p_norm = bf_p / (bf_p.max() + 1e-10)
-    bf_g_norm = bf_g / (bf_g.max() + 1e-10)
-    l_bf = F.mse_loss(bf_p_norm, bf_g_norm)
+        # --- L_bfactor: MSE on normalised B-factor profiles ---
+        bf_p_norm = bf_p / (bf_p.max() + 1e-10)
+        bf_g_norm = bf_g / (bf_g.max() + 1e-10)
+        l_bf = F.mse_loss(bf_p_norm, bf_g_norm)
 
-    # --- L_eigvec: 1 − |cos(v_pred, v_gt)| (phase-invariant) ---
-    cos_sim = torch.abs(
-        F.cosine_similarity(vecs_p.T, vecs_g.T, dim=-1)
-    )  # [n_modes]
-    l_vec = (1.0 - cos_sim).mean()
+        # --- L_eigvec: 1 − |cos(v_pred, v_gt)| (phase-invariant) ---
+        cos_sim = torch.abs(
+            F.cosine_similarity(vecs_p.T, vecs_g.T, dim=-1)
+        )  # [n_modes]
+        l_vec = (1.0 - cos_sim).mean()
 
-    cpu_loss = w_eigenvalue * l_eig + w_bfactor * l_bf + w_eigvec * l_vec
+        cpu_loss = w_eigenvalue * l_eig + w_bfactor * l_bf + w_eigvec * l_vec
 
     details = {
         "L_eigenvalue": l_eig.item(),
@@ -148,13 +151,15 @@ def gnm_loss(
     }
 
     # --- Connect gradient back to c_pred via manual backward ---
-    # Compute gradient of GNM loss w.r.t. contact matrix on CPU
-    cpu_loss.backward()
-    gnm_grad = c_pred_leaf.grad  # [N, N] on CPU
-
-    # Surrogate loss: dot product with gradient gives correct grad direction
-    # loss_surrogate.backward() → c_pred.grad = gnm_grad (scaled)
-    loss = (c_pred * gnm_grad.to(device).detach()).sum()
+    if grad_enabled:
+        with torch.enable_grad():
+            cpu_loss.backward()
+            gnm_grad = c_pred_leaf.grad  # [N, N] on CPU
+        # Surrogate loss: dot product with gradient gives correct grad direction
+        loss = (c_pred * gnm_grad.to(device).detach()).sum()
+    else:
+        # During validation: return scalar loss value only (no grad needed)
+        loss = cpu_loss.detach().to(device)
 
     return loss, details
 
