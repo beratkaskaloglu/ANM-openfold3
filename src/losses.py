@@ -107,10 +107,11 @@ def gnm_loss(
     Returns:
         (scalar loss, dict of component values)
     """
-    # Run entire GNM pipeline on CPU to avoid CUDA assert errors
+    # Run GNM pipeline on CPU (eigh is more stable on CPU)
+    # Keep c_pred in the computation graph so gradients flow back
     device = c_pred.device
-    c_pred_cpu = c_pred.detach().cpu()
-    c_gt_cpu = c_gt.detach().cpu()
+    c_pred_cpu = c_pred.cpu()          # no detach — gradient flows
+    c_gt_cpu = c_gt.detach().cpu()     # gt doesn't need grad
 
     gamma_pred = soft_kirchhoff(c_pred_cpu)
     gamma_gt = soft_kirchhoff(c_gt_cpu)
