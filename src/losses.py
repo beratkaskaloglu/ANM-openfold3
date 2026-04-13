@@ -36,8 +36,8 @@ def focal_loss(
     idx = torch.arange(n, device=c_pred.device)
     sep_mask = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs() >= seq_sep_min
 
-    pred_masked = c_pred[..., sep_mask].clamp(1e-7, 1.0 - 1e-7)
-    gt_masked = c_gt[..., sep_mask]
+    pred_masked = c_pred[..., sep_mask].clamp(1e-6, 1.0 - 1e-6)
+    gt_masked = c_gt[..., sep_mask].clamp(0.0, 1.0)
 
     # Per-element BCE (no reduction)
     bce = F.binary_cross_entropy(pred_masked, gt_masked, reduction="none")
@@ -206,12 +206,20 @@ def total_loss(
     Returns:
         (scalar loss, dict of all component values)
     """
+    # Safety clamp — prevent NaN/Inf from high LR or unstable predictions
+    c_pred = c_pred.clamp(1e-6, 1.0 - 1e-6)
+
     if use_focal:
         l_contact = focal_loss(
             c_pred, c_gt, focal_gamma=focal_gamma, focal_alpha=focal_alpha
         )
     else:
         l_contact = contact_loss(c_pred, c_gt)
+
+    # Sync CUDA before CPU transfer in gnm_loss
+    if c_pred.is_cuda:
+        torch.cuda.synchronize()
+
     l_gnm, gnm_details = gnm_loss(c_pred, c_gt, n_modes=n_modes)
 
     loss = alpha * l_contact + beta * l_gnm
