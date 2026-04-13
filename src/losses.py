@@ -151,14 +151,15 @@ def gnm_loss(
     }
 
     # --- Connect gradient back to c_pred via manual backward ---
-    if grad_enabled:
+    if grad_enabled and cpu_loss.grad_fn is not None:
         with torch.enable_grad():
             cpu_loss.backward()
-            gnm_grad = c_pred_leaf.grad  # [N, N] on CPU
-        # Surrogate loss: dot product with gradient gives correct grad direction
-        loss = (c_pred * gnm_grad.to(device).detach()).sum()
+            gnm_grad = c_pred_leaf.grad
+        if gnm_grad is not None:
+            loss = (c_pred * gnm_grad.to(device).detach()).sum()
+        else:
+            loss = cpu_loss.detach().to(device)
     else:
-        # During validation: return scalar loss value only (no grad needed)
         loss = cpu_loss.detach().to(device)
 
     return loss, details
