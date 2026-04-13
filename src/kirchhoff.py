@@ -55,13 +55,13 @@ def gnm_decompose(
         eigenvectors: [N, n_modes] corresponding eigenvectors.
         b_factors:    [N]          B_i = Σ_k (V_ik² / λ_k).
     """
-    # Run eigh on CPU to avoid CUSOLVER_STATUS_INTERNAL_ERROR on some GPUs
-    # .float().cpu() ensures a clean contiguous copy for CUDA-sourced tensors
+    # Use float64 for eigh numerical stability, then cast back
     device = gamma.device
-    gamma_cpu = gamma.to(dtype=torch.float64, device='cpu')
-    vals, vecs = torch.linalg.eigh(gamma_cpu)
-    vals = vals.to(dtype=gamma.dtype, device=device)
-    vecs = vecs.to(dtype=gamma.dtype, device=device)
+    orig_dtype = gamma.dtype
+    gamma64 = gamma.to(dtype=torch.float64, device='cpu')
+    vals, vecs = torch.linalg.eigh(gamma64)
+    vals = vals.to(dtype=orig_dtype, device=device)
+    vecs = vecs.to(dtype=orig_dtype, device=device)
 
     # Clamp n_modes to available non-trivial modes
     max_modes = vals.shape[-1] - 1

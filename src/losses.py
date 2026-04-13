@@ -97,6 +97,8 @@ def gnm_loss(
     """Physics-informed GNM loss comparing Kirchhoff spectra.
 
     Both inputs go through: soft_kirchhoff → eigh → compare.
+    Uses manual gradient approach: forward on CPU (detached), then
+    connects gradient back to c_pred via surrogate loss.
 
     Args:
         c_pred: [N, N] predicted contact matrix.
@@ -107,12 +109,14 @@ def gnm_loss(
     Returns:
         (scalar loss, dict of component values)
     """
-    # Compute Kirchhoff on the original device (GPU) — gradient preserved
-    # gnm_decompose handles CPU transfer internally for eigh stability
     device = c_pred.device
 
-    gamma_pred = soft_kirchhoff(c_pred)           # grad flows through
-    gamma_gt = soft_kirchhoff(c_gt.detach())      # gt doesn't need grad
+    # --- Forward pass on CPU (avoids CUDA eigh errors) ---
+    c_pred_leaf = c_pred.detach().cpu().requires_grad_(True)
+    c_gt_cpu = c_gt.detach().cpu()
+
+    gamma_pred = soft_kirchhoff(c_pred_leaf)
+    gamma_gt = soft_kirchhoff(c_gt_cpu)
 
     vals_p, vecs_p, bf_p = gnm_decompose(gamma_pred, n_modes)
     vals_g, vecs_g, bf_g = gnm_decompose(gamma_gt, n_modes)
@@ -135,14 +139,23 @@ def gnm_loss(
     )  # [n_modes]
     l_vec = (1.0 - cos_sim).mean()
 
-    loss = w_eigenvalue * l_eig + w_bfactor * l_bf + w_eigvec * l_vec
-    loss = loss.to(device)
+    cpu_loss = w_eigenvalue * l_eig + w_bfactor * l_bf + w_eigvec * l_vec
 
     details = {
         "L_eigenvalue": l_eig.item(),
         "L_bfactor": l_bf.item(),
         "L_eigvec": l_vec.item(),
     }
+
+    # --- Connect gradient back to c_pred via manual backward ---
+    # Compute gradient of GNM loss w.r.t. contact matrix on CPU
+    cpu_loss.backward()
+    gnm_grad = c_pred_leaf.grad  # [N, N] on CPU
+
+    # Surrogate loss: dot product with gradient gives correct grad direction
+    # loss_surrogate.backward() → c_pred.grad = gnm_grad (scaled)
+    loss = (c_pred * gnm_grad.to(device).detach()).sum()
+
     return loss, details
 
 
