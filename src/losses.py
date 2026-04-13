@@ -107,14 +107,12 @@ def gnm_loss(
     Returns:
         (scalar loss, dict of component values)
     """
-    # Run GNM pipeline on CPU (eigh is more stable on CPU)
-    # Keep c_pred in the computation graph so gradients flow back
+    # Compute Kirchhoff on the original device (GPU) — gradient preserved
+    # gnm_decompose handles CPU transfer internally for eigh stability
     device = c_pred.device
-    c_pred_cpu = c_pred.cpu()          # no detach — gradient flows
-    c_gt_cpu = c_gt.detach().cpu()     # gt doesn't need grad
 
-    gamma_pred = soft_kirchhoff(c_pred_cpu)
-    gamma_gt = soft_kirchhoff(c_gt_cpu)
+    gamma_pred = soft_kirchhoff(c_pred)           # grad flows through
+    gamma_gt = soft_kirchhoff(c_gt.detach())      # gt doesn't need grad
 
     vals_p, vecs_p, bf_p = gnm_decompose(gamma_pred, n_modes)
     vals_g, vecs_g, bf_g = gnm_decompose(gamma_gt, n_modes)
