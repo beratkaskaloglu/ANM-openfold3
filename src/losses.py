@@ -214,6 +214,12 @@ def total_loss(
     """
     # Safety clamp — prevent NaN/Inf from high LR or unstable predictions
     c_pred = c_pred.clamp(1e-6, 1.0 - 1e-6)
+    c_gt = c_gt.clamp(0.0, 1.0)
+
+    # NaN/Inf guard — return zero loss if inputs are corrupted
+    if torch.isnan(c_pred).any() or torch.isinf(c_pred).any():
+        zero = torch.tensor(0.0, device=c_pred.device, requires_grad=True)
+        return zero, {"L_contact": 0.0, "L_gnm": 0.0}
 
     if use_focal:
         l_contact = focal_loss(
