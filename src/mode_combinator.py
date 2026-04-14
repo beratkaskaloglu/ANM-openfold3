@@ -68,8 +68,10 @@ def collectivity_combinations(
     # Batch-vectorized collectivity computation (eigenvalue-weighted)
     scores = batch_combo_collectivity(eigenvectors, all_subsets, eigenvalues)
 
-    # Sort by collectivity descending, take top max_combos
-    top_indices = scores.argsort(descending=True)[:max_combos]
+    # Sort by collectivity descending.
+    # Each subset produces 2 combos (+df and -df), so take half.
+    n_top = max(1, max_combos // 2)
+    top_indices = scores.argsort(descending=True)[:n_top]
 
     # Precompute per-mode amplitude weights
     if eigenvalues is not None:
@@ -92,10 +94,22 @@ def collectivity_combinations(
             weight = df / (k ** 0.5)
             mode_dfs = tuple([weight] * k)
 
+        mode_label = f"m{'_'.join(map(str, mode_subset))}"
+
+        # +df direction
         combos.append(ModeCombo(
             mode_indices=mode_subset,
             dfs=mode_dfs,
-            label=f"coll_{rank:03d}_m{'_'.join(map(str, mode_subset))}",
+            label=f"coll_{rank:03d}_{mode_label}_pos",
+            collectivity_score=score,
+        ))
+
+        # -df direction (negate all displacement factors)
+        neg_dfs = tuple(-d for d in mode_dfs)
+        combos.append(ModeCombo(
+            mode_indices=mode_subset,
+            dfs=neg_dfs,
+            label=f"coll_{rank:03d}_{mode_label}_neg",
             collectivity_score=score,
         ))
 
