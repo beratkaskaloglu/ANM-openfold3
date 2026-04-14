@@ -6,7 +6,7 @@ a modified pair representation z_mod and returns CA coordinates.
 Usage (Colab with GPU):
     from src.of3_diffusion import load_of3_diffusion
 
-    diffusion_fn = load_of3_diffusion(
+    diffusion_fn, zij_trunk = load_of3_diffusion(
         query_json="path/to/query.json",   # OF3 inference query
         device="cuda",
     )
@@ -70,8 +70,8 @@ def load_of3_diffusion(
     from openfold3.projects.of3_all_atom.config.inference_query_format import (
         InferenceQuerySet,
     )
-    from openfold3.projects.of3_all_atom.project_entry import OF3ProjectEntry
     from openfold3.core.model.structure.diffusion_module import create_noise_schedule
+    from openfold3.core.utils.tensor_utils import tensor_tree_map
 
     # ── Load model ──────────────────────────────────────────────
     print("[OF3] Loading model...")
@@ -107,60 +107,61 @@ def load_of3_diffusion(
     )
     runner.setup()
 
-    # Get the actual PyTorch model from the runner
-    model = runner.trainer.model
-    if hasattr(model, "module"):
-        model = model.module  # unwrap DDP/FSDP
+    # Get the actual PyTorch model via lightning_module
+    # runner.lightning_module = OpenFold3AllAtom (LightningModule)
+    # runner.lightning_module.model = OpenFold3 (nn.Module)
+    lightning_module = runner.lightning_module
+    model = lightning_module.model
     model = model.to(device)
     model.eval()
 
     print("[OF3] Model loaded.")
 
-    # ── Run trunk once to get cached representations ────────────
-    print("[OF3] Running trunk inference (one-time)...")
+    # ── Build batch from query ─────────────────────────────────
+    print("[OF3] Preparing input batch...")
 
     query_set = InferenceQuerySet.from_json(str(query_json))
 
-    # Run full inference once to get batch + trunk outputs
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        runner.output_dir = Path(tmp_dir)
-        runner.run(query_set)
+    # Set query set on runner and build data module
+    runner.inference_query_set = query_set
+    data_module = runner.lightning_data_module
+    data_module.setup(stage="predict")
 
-        # Load saved outputs
-        latent_files = list(Path(tmp_dir).rglob("*_latent_output.pt"))
-        batch_files = list(Path(tmp_dir).rglob("*_batch.pt"))
+    # Get the first batch from the predict dataloader
+    predict_dl = data_module.predict_dataloader()
+    cached_batch = next(iter(predict_dl))
 
-        if not latent_files:
-            raise RuntimeError("OF3 inference produced no latent outputs")
+    # Move batch tensors to device
+    cached_batch = tensor_tree_map(
+        lambda t: t.to(device) if isinstance(t, torch.Tensor) else t,
+        cached_batch,
+    )
 
-        latent = torch.load(latent_files[0], map_location=device, weights_only=False)
-        cached_batch = torch.load(batch_files[0], map_location=device, weights_only=False) if batch_files else None
+    print("[OF3] Input batch ready.")
 
-    # Extract cached trunk representations
-    si_trunk_cached = latent["si_trunk"].to(device)       # [1, 1, N_token, C_s]
-    zij_trunk_cached = latent["zij_trunk"].to(device)      # [1, 1, N_token, N_token, C_z]
+    # ── Run trunk once to get cached representations ────────────
+    print("[OF3] Running trunk inference (one-time)...")
 
-    # si_input is not in latent output — re-derive from trunk
-    # We need to run trunk once more to get si_input, or extract it
-    # For now: run trunk to get all three
     with torch.no_grad():
+        num_cycles = model.shared.num_recycles + 1
         si_input_cached, si_trunk_cached, zij_trunk_cached = model.run_trunk(
-            batch=cached_batch, num_cycles=model.shared.num_recycles + 1,
+            batch=cached_batch, num_cycles=num_cycles,
             inplace_safe=True,
         )
-        # Add sample dimension
+        # Add sample dimension: [*, N_token, C] -> [*, 1, N_token, C]
         si_input_cached = si_input_cached.unsqueeze(1)
         si_trunk_cached = si_trunk_cached.unsqueeze(1)
         zij_trunk_cached = zij_trunk_cached.unsqueeze(1)
 
+    # Expand batch for sampling dimension (same as model.forward does)
+    ref_space_uid_to_perm = cached_batch.pop("ref_space_uid_to_perm", None)
+    cached_batch = tensor_tree_map(lambda t: t.unsqueeze(1), cached_batch)
+    if ref_space_uid_to_perm is not None:
+        cached_batch["ref_space_uid_to_perm"] = ref_space_uid_to_perm
+
     # Get token→atom mapping for CA extraction
-    if cached_batch is not None:
-        num_atoms_per_token = cached_batch.get("num_atoms_per_token")
-        start_atom_index = cached_batch.get("start_atom_index")
-    else:
-        num_atoms_per_token = None
-        start_atom_index = None
+    num_atoms_per_token = cached_batch.get("num_atoms_per_token")
+    start_atom_index = cached_batch.get("start_atom_index")
 
     N_token = si_trunk_cached.shape[-2]
     C_z = zij_trunk_cached.shape[-1]
@@ -216,13 +217,9 @@ def load_of3_diffusion(
         # Reshape z_mod to match OF3 format: [1, 1, N_token, N_token, C_z]
         zij_modified = z_mod.unsqueeze(0).unsqueeze(0).to(device)
 
-        # Expand batch for sampling dimension
-        from openfold3.core.utils.tensor_utils import tensor_tree_map
-        batch_expanded = tensor_tree_map(lambda t: t.unsqueeze(1), cached_batch)
-
         # Run SampleDiffusion with modified z_ij
         atom_positions = model.sample_diffusion(
-            batch=batch_expanded,
+            batch=cached_batch,
             si_input=si_input_cached,
             si_trunk=si_trunk_cached,
             zij_trunk=zij_modified,
