@@ -31,7 +31,7 @@ from .losses import focal_loss, contact_loss, gnm_loss, reconstruction_loss, tot
 from .mode_combinator import ModeCombo, collectivity_combinations, grid_combinations, random_combinations, targeted_combinations
 
 # Mode drive
-from .mode_drive import ModeDriveConfig, ModeDrivePipeline, ModeDriveResult, StepResult, compute_rmsd, kabsch_superimpose, tm_score
+from .mode_drive import ModeDriveConfig, ModeDrivePipeline, ModeDriveResult, StepResult, compute_rmsd, kabsch_superimpose, tm_score, make_pseudo_diffusion
 
 # Model
 from .model import GNMContactLearner
