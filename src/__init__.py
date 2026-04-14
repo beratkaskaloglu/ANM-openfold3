@@ -33,6 +33,11 @@ from .mode_combinator import ModeCombo, collectivity_combinations, grid_combinat
 # Mode drive
 from .mode_drive import ModeDriveConfig, ModeDrivePipeline, ModeDriveResult, StepResult, compute_rmsd, kabsch_superimpose, tm_score, make_pseudo_diffusion
 
+# OF3 diffusion (lazy import — requires openfold3-repo)
+def load_of3_diffusion(*args, **kwargs):
+    from .of3_diffusion import load_of3_diffusion as _load
+    return _load(*args, **kwargs)
+
 # Model
 from .model import GNMContactLearner
 
