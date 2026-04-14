@@ -17,6 +17,7 @@ Anisotropic Network Model (ANM) tabanli protein dinamik analizi ile OpenFold3 ya
 - [[architecture/08-anm-theory]] - ANM teorisi: Hessian, 3D modlar, collectivity, GNM karsilastirmasi
 - [[architecture/09-anm-mode-drive]] - ANM Mode-Drive Pipeline: collectivity-ranked iteratif konformasyonel kesif
 - [[architecture/10-iterative-refinement]] - df eskalasyonu, iterasyon dinamikleri, failure modlari
+- [[architecture/11-pipeline-mathematics]] - End-to-end matematiksel referans: Hessian, eigen, collectivity, displacement, contact, z-blending, Kabsch, RMSD, TM-score
 
 ### Modules
 - [[modules/anm-mode-drive]] - ANM Mode-Drive modul referansi ve API
@@ -55,6 +56,7 @@ ANM-openfold3/
 │   ├── losses.py             # Training loss functions
 │   ├── mode_combinator.py    # Collectivity-ranked mod kombinasyonlari
 │   ├── mode_drive.py         # Pipeline orchestrator (df eskalasyonlu)
+│   ├── of3_diffusion.py      # OF3 diffusion wrapper (trunk once, diffusion per step)
 │   ├── model.py              # Model tanimlari
 │   └── train.py              # Training loop
 ├── tests/                   # Test suite

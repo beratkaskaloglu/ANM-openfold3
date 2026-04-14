@@ -10,6 +10,7 @@
 | `src/coords_to_contact.py` | `coords_to_contact` |
 | `src/mode_combinator.py` | `ModeCombo`, `collectivity_combinations`, `grid_combinations`, `random_combinations`, `targeted_combinations` |
 | `src/mode_drive.py` | `ModeDriveConfig`, `ModeDrivePipeline`, `StepResult`, `ModeDriveResult` |
+| `src/of3_diffusion.py` | `load_of3_diffusion` — OF3 trunk once, SampleDiffusion per step |
 
 ## API Referansi
 
@@ -115,6 +116,35 @@ Step 4: RMSD=2.31Å  df=0.45  combo=coll_001_m0    κ=0.784
 Step 5: RMSD=2.67Å  df=0.68  combo=coll_003_m1_2  κ=0.698
 ```
 
+### OF3 Diffusion Entegrasyonu (`src/of3_diffusion.py`)
+
+```python
+from src.of3_diffusion import load_of3_diffusion
+
+# Trunk ONCE calisir, diffusion her step'te tekrar calisir
+diffusion_fn, zij_trunk = load_of3_diffusion(
+    query_json="query.json",   # OF3 inference query
+    device="cuda",
+)
+
+# Pipeline ile kullanim
+pipeline = ModeDrivePipeline(converter, config, diffusion_fn=diffusion_fn)
+result = pipeline.run(initial_coords_ca, zij_trunk)
+```
+
+**Akis:** z_mod → SampleDiffusion (DiffusionConditioning → AtomAttentionEncoder → DiffusionTransformer → AtomAttentionDecoder) → all-atom coords → CA extraction
+
+**Gereksinimler:** A100/V100 GPU (~16GB VRAM), openfold3-repo clone + pip install
+
+### Bidirectional Displacement
+
+Her mode combo icin hem +df hem -df yonunde deplasman denenir:
+- `coll_000_m0_1_pos` — pozitif yon
+- `coll_000_m0_1_neg` — negatif yon
+
+Target varsa: RMSD-to-target en dusuk olan secilir.
+Target yoksa: RMSD-from-initial en yuksek olan secilir.
+
 ## Temel Prensipler
 
 1. **RMSD initial'den olculur** — yuksek = daha fazla kesif = iyi
@@ -122,6 +152,8 @@ Step 5: RMSD=2.67Å  df=0.68  combo=coll_003_m1_2  κ=0.698
 3. **Collectivity-first** — en kollektif combo once denenir
 4. **df eskalasyonu** — RMSD artmiyorsa df otomatik artar
 5. **Iteratif z_ij** — her adimda hem coords hem z_ij guncellenir
+6. **Bidirectional ±df** — her combo +/- iki yonde denenir
+7. **Real OF3 diffusion** — pseudo-diffusion degil, gercek SampleDiffusion
 
 ## Mimari Dokumanlar
 
@@ -129,3 +161,4 @@ Step 5: RMSD=2.67Å  df=0.68  combo=coll_003_m1_2  κ=0.698
 - [[architecture/09-anm-mode-drive]] — Pipeline diyagramlari ve pseudocode
 - [[architecture/10-iterative-refinement]] — df eskalasyonu, failure modlari
 - [[architecture/05-gnm-contact-learner]] — ContactProjectionHead (z ↔ C)
+- [[architecture/11-pipeline-mathematics]] — End-to-end matematiksel referans
