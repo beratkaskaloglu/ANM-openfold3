@@ -112,21 +112,38 @@ def displace(
     coords: torch.Tensor,
     mode_vectors: torch.Tensor,
     dfs: torch.Tensor,
+    eigenvalues: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply mode-driven displacement to coordinates.
 
-    new_coords = coords + sum_k(df_k * v_k)
+    Without eigenvalues:
+        new_coords = coords + sum_k(df_k * v_k)
+
+    With eigenvalues (physically correct):
+        new_coords = coords + sum_k(df_k * (1/sqrt(lambda_k)) * v_k)
+
+    The 1/sqrt(lambda) weighting ensures low-frequency modes (small lambda)
+    produce larger displacements, matching the physical amplitude of each mode.
 
     Args:
         coords:       [N, 3] original CA positions.
         mode_vectors: [N, n_selected, 3] selected mode displacement vectors.
         dfs:          [n_selected] displacement factors.
+        eigenvalues:  [n_selected] eigenvalues for selected modes (optional).
 
     Returns:
         new_coords: [N, 3] displaced positions.
     """
+    if eigenvalues is not None:
+        # Weight by 1/sqrt(lambda): low-freq modes get larger amplitude
+        amp = 1.0 / (eigenvalues.sqrt() + 1e-10)  # [n_sel]
+        amp = amp / (amp.sum() + 1e-10)            # normalize so total scale ~ 1
+        weights = dfs * amp                        # [n_sel]
+    else:
+        weights = dfs
+
     # [N, n_sel, 3] * [n_sel] -> sum -> [N, 3]
-    displacement = (mode_vectors * dfs[None, :, None]).sum(dim=1)
+    displacement = (mode_vectors * weights[None, :, None]).sum(dim=1)
     return coords + displacement
 
 
@@ -172,23 +189,33 @@ def collectivity(eigenvectors: torch.Tensor) -> torch.Tensor:
 def combo_collectivity(
     eigenvectors: torch.Tensor,
     mode_indices: tuple[int, ...],
+    eigenvalues: torch.Tensor | None = None,
 ) -> float:
     """Compute combined collectivity for a set of modes.
 
     For a multi-mode combination, sums the displacement vectors
-    (unit-weighted) and computes the collectivity of the summed field.
+    weighted by 1/sqrt(lambda) and computes the collectivity of
+    the summed field.
 
     Args:
         eigenvectors: [N, n_modes, 3] per-residue displacement vectors.
         mode_indices: Indices of modes in the combination.
+        eigenvalues:  [n_modes] eigenvalues (optional, for weighting).
 
     Returns:
         Combined collectivity score (higher = more collective).
     """
     N = eigenvectors.shape[0]
+    idx = list(mode_indices)
 
-    # Sum selected mode vectors: [N, 3]
-    selected = eigenvectors[:, list(mode_indices), :]  # [N, k, 3]
+    # Select and weight mode vectors
+    selected = eigenvectors[:, idx, :]  # [N, k, 3]
+
+    if eigenvalues is not None:
+        amp = 1.0 / (eigenvalues[idx].sqrt() + 1e-10)  # [k]
+        amp = amp / (amp.sum() + 1e-10)
+        selected = selected * amp[None, :, None]  # [N, k, 3]
+
     combined = selected.sum(dim=1)  # [N, 3]
 
     # Squared displacement per residue: [N]
@@ -207,6 +234,7 @@ def combo_collectivity(
 def batch_combo_collectivity(
     eigenvectors: torch.Tensor,
     combo_indices_list: list[tuple[int, ...]],
+    eigenvalues: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized collectivity for many mode combos at once.
 
@@ -214,9 +242,13 @@ def batch_combo_collectivity(
     [n_combos, N, 3] tensor of summed displacement fields via a
     sparse mask and computes all collectivities in one shot.
 
+    When eigenvalues are provided, modes are weighted by 1/sqrt(lambda)
+    so low-frequency modes dominate the combined displacement field.
+
     Args:
         eigenvectors:       [N, n_modes, 3] per-residue displacement vectors.
         combo_indices_list: List of tuples, each containing mode indices.
+        eigenvalues:        [n_modes] eigenvalues (optional, for weighting).
 
     Returns:
         kappa: [n_combos] collectivity scores.
@@ -226,18 +258,26 @@ def batch_combo_collectivity(
     device = eigenvectors.device
     dtype = eigenvectors.dtype
 
-    # Build mask: [n_combos, n_modes] — 1.0 where mode is in combo
+    # Build mask: [n_combos, n_modes]
+    # When eigenvalues given: mask value = 1/sqrt(lambda), normalized per combo
     mask = torch.zeros(n_combos, n_modes, device=device, dtype=dtype)
-    for i, indices in enumerate(combo_indices_list):
-        for j in indices:
-            mask[i, j] = 1.0
 
-    # mask:         [n_combos, n_modes]
-    # eigenvectors: [N, n_modes, 3]
-    # We want: combined[c, i, d] = sum_m mask[c, m] * eigvec[i, m, d]
-    # einsum: cm, imd -> cid
+    if eigenvalues is not None:
+        amp = 1.0 / (eigenvalues.sqrt() + 1e-10)  # [n_modes]
+        for i, indices in enumerate(combo_indices_list):
+            for j in indices:
+                mask[i, j] = amp[j]
+            # Normalize per combo so total weight ~ 1
+            row_sum = mask[i].sum()
+            if row_sum > 0:
+                mask[i] /= row_sum
+    else:
+        for i, indices in enumerate(combo_indices_list):
+            for j in indices:
+                mask[i, j] = 1.0
+
+    # einsum: cm, imd -> cid  →  [n_combos, N, 3]
     combined = torch.einsum("cm, imd -> cid", mask, eigenvectors)
-    # result: [n_combos, N, 3]
 
     # Squared displacement per residue: [n_combos, N]
     sq_norms = (combined ** 2).sum(dim=-1)

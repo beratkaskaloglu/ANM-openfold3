@@ -37,15 +37,13 @@ def collectivity_combinations(
     max_combo_size: int = 3,
     df: float = 0.6,
     max_combos: int = 50,
+    eigenvalues: torch.Tensor | None = None,
 ) -> list[ModeCombo]:
-    """Generate mode combos ranked by collectivity (most collective first).
+    """Generate mode combos ranked by eigenvalue-weighted collectivity.
 
     For each subset size 1..max_combo_size, enumerates all mode subsets,
-    computes combined collectivity, ranks descending, and assigns a
-    global displacement factor.
-
-    The combined displacement is normalized to unit length then scaled by df,
-    so df directly controls the Angstrom-scale displacement magnitude.
+    computes combined collectivity (weighted by 1/sqrt(lambda)),
+    ranks descending, and assigns eigenvalue-weighted displacement factors.
 
     Args:
         eigenvectors:      [N, n_modes, 3] per-residue mode vectors.
@@ -53,6 +51,7 @@ def collectivity_combinations(
         max_combo_size:    Maximum modes per combination (e.g. 3 or 5).
         df:                Global displacement factor (Angstrom scale).
         max_combos:        Maximum combinations to return.
+        eigenvalues:       [n_modes] eigenvalues for amplitude weighting.
 
     Returns:
         List of ModeCombo sorted by collectivity (descending).
@@ -66,22 +65,36 @@ def collectivity_combinations(
     if not all_subsets:
         return []
 
-    # Batch-vectorized collectivity computation (single GPU/CPU pass)
-    scores = batch_combo_collectivity(eigenvectors, all_subsets)
+    # Batch-vectorized collectivity computation (eigenvalue-weighted)
+    scores = batch_combo_collectivity(eigenvectors, all_subsets, eigenvalues)
 
     # Sort by collectivity descending, take top max_combos
     top_indices = scores.argsort(descending=True)[:max_combos]
+
+    # Precompute per-mode amplitude weights
+    if eigenvalues is not None:
+        amp = 1.0 / (eigenvalues.sqrt() + 1e-10)  # [n_modes]
+    else:
+        amp = None
 
     combos: list[ModeCombo] = []
     for rank, idx in enumerate(top_indices.tolist()):
         mode_subset = all_subsets[idx]
         score = scores[idx].item()
         k = len(mode_subset)
-        weight = df / (k ** 0.5)
-        dfs = tuple([weight] * k)
+
+        if amp is not None:
+            # Per-mode df weighted by 1/sqrt(lambda), normalized, scaled by df
+            mode_amps = torch.stack([amp[m] for m in mode_subset])
+            mode_amps = mode_amps / (mode_amps.sum() + 1e-10)  # normalize
+            mode_dfs = tuple((df * mode_amps).tolist())
+        else:
+            weight = df / (k ** 0.5)
+            mode_dfs = tuple([weight] * k)
+
         combos.append(ModeCombo(
             mode_indices=mode_subset,
-            dfs=dfs,
+            dfs=mode_dfs,
             label=f"coll_{rank:03d}_m{'_'.join(map(str, mode_subset))}",
             collectivity_score=score,
         ))

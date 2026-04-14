@@ -229,6 +229,7 @@ class ModeDrivePipeline:
                 max_combo_size=cfg.max_combo_size,
                 df=df,
                 max_combos=cfg.n_combinations,
+                eigenvalues=eigenvalues,
             )
         elif cfg.combination_strategy == "grid":
             return grid_combinations(
@@ -297,9 +298,10 @@ class ModeDrivePipeline:
         indices = list(combo.mode_indices)
         modes_sel = eigenvectors[:, indices, :]  # [N, k, 3]
         dfs = torch.tensor(combo.dfs, device=device, dtype=coords_ca.dtype)
+        eig_sel = eigenvalues[indices]  # [k]
 
-        # Displace from current coords
-        displaced = displace(coords_ca, modes_sel, dfs)
+        # Displace from current coords (eigenvalue-weighted)
+        displaced = displace(coords_ca, modes_sel, dfs, eigenvalues=eig_sel)
 
         # Contact map from displaced coordinates
         contact = coords_to_contact(
