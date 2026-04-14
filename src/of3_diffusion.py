@@ -59,7 +59,9 @@ def load_of3_diffusion(
         use_templates:     Whether to use templates.
 
     Returns:
-        diffusion_fn: Callable([N, N, 128]) -> [N, 3] CA coordinates.
+        Tuple of:
+            diffusion_fn: Callable([N, N, 128]) -> [N, 3] CA coordinates.
+            zij_trunk:     [N_token, N_token, C_z] original trunk pair representation.
     """
     _ensure_of3_importable()
 
@@ -233,5 +235,8 @@ def load_of3_diffusion(
         ca = _extract_ca(atom_positions)
         return ca.to(z_mod.device)
 
+    # Return zij_trunk without batch/sample dims: [N_token, N_token, C_z]
+    zij_trunk_out = zij_trunk_cached.squeeze(0).squeeze(0).detach().cpu()
+
     print("[OF3] Diffusion function ready.")
-    return diffusion_fn
+    return diffusion_fn, zij_trunk_out
