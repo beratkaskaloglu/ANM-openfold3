@@ -1,1 +1,1 @@
-"GNM-Contact Learner: pair representation → learned connectivity matrix."
+"ANM-OpenFold3: pair representation ↔ contact map ↔ ANM mode-driven dynamics."
