@@ -125,6 +125,9 @@ def load_of3_diffusion(
     # Set query set on runner and build data module
     runner.inference_query_set = query_set
     data_module = runner.lightning_data_module
+
+    # Run prepare_data first — this triggers ColabFold MSA server if enabled
+    data_module.prepare_data()
     data_module.setup(stage="predict")
 
     # Get the first batch from the predict dataloader
