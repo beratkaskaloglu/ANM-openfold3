@@ -195,6 +195,7 @@ def total_loss(
     use_focal: bool = False,
     focal_gamma: float = 2.0,
     focal_alpha: float = 0.75,
+    seq_sep_min: int = 6,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Combined loss: L = α·L_contact + β·L_gnm + γ·L_recon.
 
@@ -225,10 +226,11 @@ def total_loss(
 
     if use_focal:
         l_contact = focal_loss(
-            c_pred, c_gt, focal_gamma=focal_gamma, focal_alpha=focal_alpha
+            c_pred, c_gt, seq_sep_min=seq_sep_min,
+            focal_gamma=focal_gamma, focal_alpha=focal_alpha,
         )
     else:
-        l_contact = contact_loss(c_pred, c_gt)
+        l_contact = contact_loss(c_pred, c_gt, seq_sep_min=seq_sep_min)
 
     # Sync CUDA before CPU transfer in gnm_loss
     if c_pred.is_cuda:
