@@ -8,10 +8,13 @@ openfold3-mlx/
 # Python
 __pycache__/
 *.py[cod]
+*.pyc
+*.pyo
 *.egg-info/
 dist/
 build/
 .eggs/
+.pytest_cache/
 
 # Environments
 .env
@@ -22,10 +25,13 @@ env/
 *.pt
 *.pth
 *.ckpt
+*.npz
 pair_reprs/
 coords/
 checkpoints/
 pdb_cache/
+data/
+wandb/
 
 # Jupyter
 .ipynb_checkpoints/

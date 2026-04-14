@@ -15,7 +15,7 @@ from typing import Sequence
 
 import torch
 
-from .anm import combo_collectivity
+from .anm import batch_combo_collectivity, combo_collectivity
 
 
 @dataclass(frozen=True)
@@ -57,24 +57,26 @@ def collectivity_combinations(
     Returns:
         List of ModeCombo sorted by collectivity (descending).
     """
-    candidates: list[tuple[float, tuple[int, ...]]] = []
-
+    # Enumerate all mode subsets of size 1..max_combo_size
+    all_subsets: list[tuple[int, ...]] = []
     for k in range(1, min(max_combo_size, n_modes_available) + 1):
         for mode_subset in combinations(range(n_modes_available), k):
-            score = combo_collectivity(eigenvectors, mode_subset)
-            candidates.append((score, mode_subset))
+            all_subsets.append(mode_subset)
 
-    # Sort by collectivity descending
-    candidates.sort(key=lambda x: x[0], reverse=True)
+    if not all_subsets:
+        return []
 
-    # Trim to max_combos
-    candidates = candidates[:max_combos]
+    # Batch-vectorized collectivity computation (single GPU/CPU pass)
+    scores = batch_combo_collectivity(eigenvectors, all_subsets)
+
+    # Sort by collectivity descending, take top max_combos
+    top_indices = scores.argsort(descending=True)[:max_combos]
 
     combos: list[ModeCombo] = []
-    for rank, (score, mode_subset) in enumerate(candidates):
+    for rank, idx in enumerate(top_indices.tolist()):
+        mode_subset = all_subsets[idx]
+        score = scores[idx].item()
         k = len(mode_subset)
-        # Each mode gets equal weight, normalized so sum of squares = 1,
-        # then scaled by global df
         weight = df / (k ** 0.5)
         dfs = tuple([weight] * k)
         combos.append(ModeCombo(

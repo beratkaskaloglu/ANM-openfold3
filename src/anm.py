@@ -204,6 +204,57 @@ def combo_collectivity(
     return ((1.0 / N) * entropy.exp()).item()
 
 
+def batch_combo_collectivity(
+    eigenvectors: torch.Tensor,
+    combo_indices_list: list[tuple[int, ...]],
+) -> torch.Tensor:
+    """Vectorized collectivity for many mode combos at once.
+
+    Instead of looping Python-side over each combo, this builds a
+    [n_combos, N, 3] tensor of summed displacement fields via a
+    sparse mask and computes all collectivities in one shot.
+
+    Args:
+        eigenvectors:       [N, n_modes, 3] per-residue displacement vectors.
+        combo_indices_list: List of tuples, each containing mode indices.
+
+    Returns:
+        kappa: [n_combos] collectivity scores.
+    """
+    N, n_modes, _ = eigenvectors.shape
+    n_combos = len(combo_indices_list)
+    device = eigenvectors.device
+    dtype = eigenvectors.dtype
+
+    # Build mask: [n_combos, n_modes] — 1.0 where mode is in combo
+    mask = torch.zeros(n_combos, n_modes, device=device, dtype=dtype)
+    for i, indices in enumerate(combo_indices_list):
+        for j in indices:
+            mask[i, j] = 1.0
+
+    # mask:         [n_combos, n_modes]
+    # eigenvectors: [N, n_modes, 3]
+    # We want: combined[c, i, d] = sum_m mask[c, m] * eigvec[i, m, d]
+    # einsum: cm, imd -> cid
+    combined = torch.einsum("cm, imd -> cid", mask, eigenvectors)
+    # result: [n_combos, N, 3]
+
+    # Squared displacement per residue: [n_combos, N]
+    sq_norms = (combined ** 2).sum(dim=-1)
+
+    # Normalize per combo: [n_combos, N]
+    u2 = sq_norms / (sq_norms.sum(dim=-1, keepdim=True) + 1e-30)
+
+    # Shannon entropy: [n_combos]
+    u2_safe = u2.clamp(min=1e-30)
+    entropy = -(u2_safe * u2_safe.log()).sum(dim=-1)
+
+    # Collectivity
+    kappa = (1.0 / N) * entropy.exp()
+
+    return kappa
+
+
 def anm_bfactors(
     eigenvalues: torch.Tensor,
     eigenvectors: torch.Tensor,

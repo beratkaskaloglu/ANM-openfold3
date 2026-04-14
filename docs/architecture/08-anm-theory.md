@@ -239,6 +239,7 @@ graph TD
 
 ## Iliskili Dokumanlar
 
-- [[06-gnm-math-detail]] — GNM matematigi (Kirchhoff, skaler eigendecomposition)
+- [[06-gnm-math-detail]] — GNM matematigi (Kirchhoff, skaler eigendecomposition) — GNM vs ANM karsilastirmasi icin Bolum 1'e bakin
 - [[09-anm-mode-drive]] — ANM modlarini OF3 diffusion ile birlestiren pipeline
 - [[05-gnm-contact-learner]] — Contact head: z_ij ↔ C donusumu
+- [[modules/anm-mode-drive]] — ANM Mode-Drive modul API referansi

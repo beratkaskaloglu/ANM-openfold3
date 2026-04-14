@@ -102,9 +102,81 @@ class ModeDriveResult:
     total_steps: int = 0
 
 
+def kabsch_superimpose(
+    ref: torch.Tensor,
+    mobile: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Kabsch superimposition: align mobile onto ref.
+
+    Args:
+        ref: [N, 3] reference coordinates
+        mobile: [N, 3] mobile coordinates to align
+
+    Returns:
+        aligned: [N, 3] mobile after optimal rotation+translation
+        rmsd: scalar RMSD after alignment
+    """
+    # 1. Center both
+    ref_center = ref.mean(dim=0)
+    mob_center = mobile.mean(dim=0)
+    ref_centered = ref - ref_center
+    mob_centered = mobile - mob_center
+
+    # 2. Covariance matrix
+    H = mob_centered.T @ ref_centered  # [3, 3]
+
+    # 3. SVD
+    U, S, Vt = torch.linalg.svd(H)
+
+    # 4. Correct reflection
+    d = torch.det(Vt.T @ U.T)
+    sign_matrix = torch.diag(
+        torch.tensor([1.0, 1.0, torch.sign(d)], device=ref.device, dtype=ref.dtype),
+    )
+
+    # 5. Optimal rotation
+    R = Vt.T @ sign_matrix @ U.T
+
+    # 6. Apply
+    aligned = (mob_centered @ R.T) + ref_center
+
+    # 7. RMSD
+    rmsd_val = ((ref - aligned) ** 2).sum(dim=-1).mean().sqrt()
+
+    return aligned, rmsd_val
+
+
 def compute_rmsd(a: torch.Tensor, b: torch.Tensor) -> float:
-    """RMSD between two coordinate sets [N, 3]."""
-    return ((a - b) ** 2).sum(dim=-1).mean().sqrt().item()
+    """RMSD between two coordinate sets after Kabsch superimposition [N, 3]."""
+    _, rmsd_val = kabsch_superimpose(a, b)
+    return rmsd_val.item()
+
+
+def tm_score(
+    coords_model: torch.Tensor,
+    coords_ref: torch.Tensor,
+) -> float:
+    """Approximate TM-score between two CA coordinate sets.
+
+    TM-score = (1/N) * sum_i 1 / (1 + (d_i / d0)^2)
+
+    where d_i is per-residue distance after Kabsch superimposition
+    and d0 = 1.24 * (N - 15)^(1/3) - 1.8
+
+    Args:
+        coords_model: [N, 3] model coordinates
+        coords_ref:   [N, 3] reference coordinates
+
+    Returns:
+        TM-score in [0, 1]
+    """
+    aligned, _ = kabsch_superimpose(coords_ref, coords_model)
+    N = coords_ref.shape[0]
+    d0 = 1.24 * (max(N, 16) - 15) ** (1.0 / 3.0) - 1.8
+    d0 = max(d0, 0.5)
+    di = ((coords_ref - aligned) ** 2).sum(dim=-1).sqrt()
+    scores = 1.0 / (1.0 + (di / d0) ** 2)
+    return scores.mean().item()
 
 
 class ModeDrivePipeline:
@@ -375,6 +447,7 @@ class ModeDrivePipeline:
         initial_coords_ca: torch.Tensor,
         zij_trunk: torch.Tensor,
         target_coords: torch.Tensor | None = None,
+        verbose: bool = True,
     ) -> ModeDriveResult:
         """Run the full iterative ANM mode-drive pipeline.
 
@@ -386,6 +459,7 @@ class ModeDrivePipeline:
             initial_coords_ca: [N, 3] starting CA positions.
             zij_trunk:         [N, N, 128] trunk pair representation.
             target_coords:     [N, 3] optional target structure.
+            verbose:           Print live RMSD/TM-score per step.
 
         Returns:
             ModeDriveResult with trajectory and per-step results.
@@ -398,6 +472,26 @@ class ModeDrivePipeline:
         z_current = zij_trunk
         prev_rmsd = 0.0  # initial RMSD from self = 0
 
+        if verbose:
+            N = initial_coords_ca.shape[0]
+            has_target = target_coords is not None
+            header = f"{'Step':>6} {'RMSD_init':>10} {'df':>6} {'Combo':>20}"
+            if has_target:
+                header += f" {'RMSD_tgt':>10} {'TM_tgt':>8}"
+            print(f"\n{'='*len(header)}")
+            print(f"Mode-Drive Pipeline | N={N} | strategy={cfg.combination_strategy} | n_steps={cfg.n_steps}")
+            print(f"{'='*len(header)}")
+            print(header)
+            print(f"{'-'*len(header)}")
+
+            # Initial state
+            init_line = f"{'Init':>6} {'0.000':>10} {'—':>6} {'—':>20}"
+            if has_target:
+                rmsd_tgt = compute_rmsd(initial_coords_ca, target_coords)
+                tm_tgt = tm_score(initial_coords_ca, target_coords)
+                init_line += f" {rmsd_tgt:>10.3f} {tm_tgt:>8.4f}"
+            print(init_line)
+
         for step_idx in range(cfg.n_steps):
             step_result = self.step(
                 coords_ca, initial_coords_ca, z_current,
@@ -407,9 +501,32 @@ class ModeDrivePipeline:
             result.trajectory.append(step_result.new_ca.clone())
             result.total_steps = step_idx + 1
 
+            if verbose:
+                combo_label = step_result.combo.label[:20]
+                line = (
+                    f"{step_idx+1:>6} "
+                    f"{step_result.rmsd:>10.3f} "
+                    f"{step_result.df_used:>6.2f} "
+                    f"{combo_label:>20}"
+                )
+                if has_target:
+                    rmsd_t = compute_rmsd(step_result.new_ca, target_coords)
+                    tm_t = tm_score(step_result.new_ca, target_coords)
+                    line += f" {rmsd_t:>10.3f} {tm_t:>8.4f}"
+                print(line)
+
             # Update for next step
             prev_rmsd = step_result.rmsd
             coords_ca = step_result.new_ca
             z_current = step_result.z_modified
+
+        if verbose:
+            print(f"{'-'*len(header)}")
+            final_rmsd = result.step_results[-1].rmsd
+            print(f"Final RMSD from initial: {final_rmsd:.3f} A")
+            if has_target:
+                final_tm = tm_score(result.step_results[-1].new_ca, target_coords)
+                print(f"Final TM-score vs target: {final_tm:.4f}")
+            print()
 
         return result

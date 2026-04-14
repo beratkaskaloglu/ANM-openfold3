@@ -459,7 +459,7 @@ print("Download pair_reprs/ and coords/ to your local machine for full training.
 3. Lokal M1'de `python -m src.train --data_dir pair_reprs/ --device mps`
 
 ## Related
-- [[architecture/07-training-plan]] - Tam eğitim stratejisi
+- [[architecture/07a-training-plan]] - Tam eğitim stratejisi
 - [[architecture/05-gnm-contact-learner]] - GNM-Contact Learner detayları
 - [[architecture/06-gnm-math-detail]] - Matematik detayları
 

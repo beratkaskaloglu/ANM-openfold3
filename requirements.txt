@@ -1,0 +1,4 @@
+torch>=2.0
+biopython>=1.80
+numpy
+scipy
