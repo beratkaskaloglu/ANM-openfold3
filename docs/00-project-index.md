@@ -18,6 +18,7 @@ Anisotropic Network Model (ANM) tabanli protein dinamik analizi ile OpenFold3 ya
 - [[architecture/09-anm-mode-drive]] - ANM Mode-Drive Pipeline: collectivity-ranked iteratif konformasyonel kesif
 - [[architecture/10-iterative-refinement]] - df eskalasyonu, iterasyon dinamikleri, failure modlari
 - [[architecture/11-pipeline-mathematics]] - End-to-end matematiksel referans: Hessian, eigen, collectivity, displacement, contact, z-blending, Kabsch, RMSD, TM-score
+- [[architecture/12-msa-training-plan]] - MSA-enabled training plan: shard yenileme, loss weights, hedef metrikler
 
 ### Modules
 - [[modules/anm-mode-drive]] - ANM Mode-Drive modul referansi ve API

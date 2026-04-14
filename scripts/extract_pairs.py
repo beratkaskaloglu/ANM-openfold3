@@ -91,6 +91,7 @@ def run_single_protein(
     InferenceExperimentConfig,
     InferenceExperimentRunner,
     InferenceQuerySet,
+    use_msa_server: bool = False,
 ) -> bool:
     """Run OpenFold3 inference for one protein and save pair repr .pt."""
     pair_file = pair_repr_dir / f"{pdb_id}_pair_repr.pt"
@@ -141,7 +142,7 @@ def run_single_protein(
             config,
             num_diffusion_samples=1,
             num_model_seeds=1,
-            use_msa_server=False,
+            use_msa_server=use_msa_server,
             use_templates=False,
             output_dir=out_dir,
         )
@@ -306,6 +307,7 @@ def process_shard_group(
     InferenceExperimentRunner,
     InferenceQuerySet,
     inference_chunk_size: int = 10,
+    use_msa_server: bool = False,
 ) -> tuple[int, int]:
     """Process a shard group: inference → pack → cleanup.
 
@@ -344,6 +346,7 @@ def process_shard_group(
                 pdb_id, sequence, query_dir, output_dir, pair_repr_dir,
                 InferenceExperimentConfig, InferenceExperimentRunner,
                 InferenceQuerySet,
+                use_msa_server=use_msa_server,
             )
 
             if ok:
@@ -436,6 +439,10 @@ def main():
         "--progress-dir", type=str, default="data/progress",
         help="Dir for completion markers",
     )
+    parser.add_argument(
+        "--use-msa-server", action="store_true", default=False,
+        help="Enable ColabFold MSA server for OF3 inference",
+    )
     args = parser.parse_args()
 
     # Load PDB list
@@ -491,6 +498,7 @@ def main():
             InferenceExperimentRunner=InferenceExperimentRunner,
             InferenceQuerySet=InferenceQuerySet,
             inference_chunk_size=args.inference_chunk_size,
+            use_msa_server=args.use_msa_server,
         )
 
         total_success += success
