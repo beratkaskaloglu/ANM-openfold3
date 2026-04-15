@@ -57,6 +57,7 @@ class ModeDriveConfig:
     n_combinations: int = 20
     z_mixing_alpha: float = 0.3
     normalize_z: bool = True
+    z_direction: str = "plus"                    # "plus" or "minus": add or subtract delta_z
 
     # Global displacement factor (collectivity strategy)
     df: float = 0.6                              # initial global df (Angstrom)
@@ -364,9 +365,13 @@ class ModeDrivePipeline:
         z_pseudo: torch.Tensor,
         zij_trunk: torch.Tensor,
     ) -> torch.Tensor:
-        """Blend pseudo z_ij with original trunk z_ij.
+        """Apply delta_z to trunk z_ij in the configured direction.
 
-        Optionally normalize z_pseudo to match trunk statistics.
+        Computes delta_z = z_pseudo - zij_trunk (the displacement in z-space),
+        then adds (+) or subtracts (-) it scaled by alpha.
+
+        z_direction="plus":  zij_trunk + alpha * delta_z  (move toward displaced state)
+        z_direction="minus": zij_trunk - alpha * delta_z  (move in opposite direction)
         """
         alpha = self.config.z_mixing_alpha
 
@@ -374,7 +379,12 @@ class ModeDrivePipeline:
             z_pseudo = (z_pseudo - z_pseudo.mean()) / (z_pseudo.std() + 1e-8)
             z_pseudo = z_pseudo * zij_trunk.std() + zij_trunk.mean()
 
-        return alpha * z_pseudo + (1.0 - alpha) * zij_trunk
+        delta_z = z_pseudo - zij_trunk
+
+        if self.config.z_direction == "minus":
+            return zij_trunk - alpha * delta_z
+        else:  # "plus"
+            return zij_trunk + alpha * delta_z
 
     def _evaluate_combo(
         self,
@@ -597,7 +607,7 @@ class ModeDrivePipeline:
             if has_target:
                 header += f" {'RMSD_tgt':>10} {'TM_tgt':>8}"
             print(f"\n{'='*len(header)}")
-            print(f"Mode-Drive Pipeline | N={N} | strategy={cfg.combination_strategy} | n_steps={cfg.n_steps}")
+            print(f"Mode-Drive Pipeline | N={N} | strategy={cfg.combination_strategy} | n_steps={cfg.n_steps} | z_dir={cfg.z_direction}")
             print(f"{'='*len(header)}")
             print(header)
             print(f"{'-'*len(header)}")
