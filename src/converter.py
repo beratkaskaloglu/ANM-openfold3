@@ -46,7 +46,7 @@ class PairContactConverter:
         self.head = ContactProjectionHead(c_z=c_z, bottleneck_dim=bottleneck_dim)
 
         if ckpt is not None:
-            self.head.load_state_dict(ckpt["model_state_dict"])
+            self.head.load_state_dict(ckpt["model_state_dict"], strict=False)
 
         self.head.to(self.device)
         self.head.eval()
@@ -135,8 +135,10 @@ class PairContactConverter:
         contact = self.z_to_contact(z)
         z_recon = self.contact_to_z(contact)
 
-        # Truncate to match shapes if needed
-        n = min(z.shape[0], z_recon.shape[0])
-        mse = ((z[:n, :n] - z_recon[:n, :n]) ** 2).mean().item()
+        # Squeeze batch dim if present for MSE computation
+        z_cmp = z.squeeze(0) if z.dim() == 4 else z
+        z_recon_cmp = z_recon.squeeze(0) if z_recon.dim() == 4 else z_recon
+        n = min(z_cmp.shape[0], z_recon_cmp.shape[0])
+        mse = ((z_cmp[:n, :n] - z_recon_cmp[:n, :n]) ** 2).mean().item()
 
         return contact, z_recon, mse

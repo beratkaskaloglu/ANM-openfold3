@@ -1,7 +1,7 @@
 """Invertible bottleneck head: pair representation ↔ contact probability.
 
 Forward:  z[B,N,N,128] → W_enc → h[B,N,N,k] → dot(v) → sigmoid → C[B,N,N]
-Inverse:  C[N,N] → logit → broadcast × v^T → [N,N,k] → W_dec → pseudo_z[N,N,128]
+Inverse:  C[N,N] → logit → learned MLP → pseudo_z[N,N,128]
 """
 
 import torch
@@ -9,12 +9,17 @@ import torch.nn as nn
 
 
 class ContactProjectionHead(nn.Module):
-    """Encoder-decoder bottleneck for pair → contact with inverse path.
+    """Encoder-decoder bottleneck for pair → contact with learned inverse.
 
-    Parameters (~8 k for k=32):
-        W_enc: Linear(c_z, bottleneck_dim)   — 128×32 = 4096
-        v:     Parameter(bottleneck_dim)      — 32
-        W_dec: Linear(bottleneck_dim, c_z)    — 32×128 = 4096
+    Forward path (unchanged):
+        W_enc: Linear(c_z, bottleneck_dim)
+        v:     Parameter(bottleneck_dim)
+
+    Inverse path (learned MLP, replaces analytical rank-1 broadcast):
+        w_inv: Linear(1, bottleneck_dim) → GELU → Linear(bottleneck_dim, c_z)
+
+    Legacy:
+        W_dec: kept for checkpoint compatibility, not used in inverse.
     """
 
     def __init__(
@@ -32,8 +37,15 @@ class ContactProjectionHead(nn.Module):
         # Contact vector: bottleneck → scalar
         self.v = nn.Parameter(torch.randn(bottleneck_dim))
 
-        # Decoder: bottleneck → pair space (inverse path)
+        # Legacy decoder (kept for checkpoint compat)
         self.w_dec = nn.Linear(bottleneck_dim, c_z, bias=False)
+
+        # Learned inverse: logit scalar → pair space
+        self.w_inv = nn.Sequential(
+            nn.Linear(1, bottleneck_dim),
+            nn.GELU(),
+            nn.Linear(bottleneck_dim, c_z),
+        )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """Encode pair repr to contact probability.
@@ -79,25 +91,23 @@ class ContactProjectionHead(nn.Module):
         z_sym = 0.5 * (z + z.transpose(1, 2))
         return self.w_enc(z_sym)
 
-    @torch.no_grad()
     def inverse(self, c: torch.Tensor) -> torch.Tensor:
         """Reconstruct pseudo pair representation from contact map.
 
+        Uses learned MLP: logit(C) → nonlinear expansion → z_pseudo.
+        Differentiable — caller should wrap in torch.no_grad() if needed.
+
         Args:
-            c: [N, N] contact probabilities in (0, 1).
+            c: [*, N, N] contact probabilities in (0, 1).
 
         Returns:
-            pseudo_z: [N, N, c_z] approximate pair representation.
+            pseudo_z: [*, N, N, c_z] approximate pair representation.
         """
         # Sigmoid inverse (logit)
         c_clamped = c.clamp(1e-6, 1.0 - 1e-6)
-        logit = torch.log(c_clamped / (1.0 - c_clamped))  # [N, N]
+        logit = torch.log(c_clamped / (1.0 - c_clamped))  # [*, N, N]
 
-        # Broadcast through contact vector → bottleneck
-        v_norm = self.v / (self.v.norm() + 1e-8)
-        h_approx = logit.unsqueeze(-1) * v_norm  # [N, N, k]
-
-        # Decode to pair space
-        pseudo_z = self.w_dec(h_approx)  # [N, N, c_z]
+        # Learned inverse: scalar → c_z dimensions
+        pseudo_z = self.w_inv(logit.unsqueeze(-1))  # [*, N, N, 1] → [*, N, N, c_z]
 
         return pseudo_z
