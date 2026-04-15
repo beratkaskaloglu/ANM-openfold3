@@ -35,6 +35,12 @@ from .mode_combinator import (
     random_combinations,
     targeted_combinations,
 )
+# Lazy import to avoid pulling OF3 dependencies when not needed
+# DiffusionResult is checked via isinstance at runtime
+try:
+    from .of3_diffusion import DiffusionResult
+except ImportError:
+    DiffusionResult = None  # type: ignore[assignment,misc]
 
 
 @dataclass
@@ -81,6 +87,19 @@ class ModeDriveConfig:
     # Targeted combinator defaults
     targeted_top_modes: int = 5
 
+    # Confidence & multi-sample
+    num_diffusion_samples: int = 1               # K: samples per diffusion call
+    confidence_ptm_cutoff: float = 0.5           # minimum pTM to accept step
+    confidence_plddt_cutoff: float = 0.6         # minimum mean pLDDT to accept
+    confidence_ranking_cutoff: float = 0.5       # minimum ranking score to accept
+
+    # Adaptive fallback
+    enable_confidence_fallback: bool = False      # enable confidence-guided fallback
+    fallback_df_factor: float = 0.5              # Level 1: df *= this
+    fallback_max_combo_size: int = 1             # Level 2: reduce to single mode
+    fallback_alpha_factor: float = 0.5           # Level 3: alpha *= this
+    max_fallback_retries: int = 3                # max retry levels per step
+
 
 @dataclass
 class StepResult:
@@ -96,6 +115,15 @@ class StepResult:
     eigenvectors: torch.Tensor       # [N, n_modes, 3]
     b_factors: torch.Tensor          # [N]
     df_used: float = 0.0             # actual df applied
+
+    # Confidence metrics (populated when multi-sample diffusion is used)
+    plddt: torch.Tensor | None = None         # [N] best sample per-residue pLDDT
+    ptm: float | None = None                  # best sample pTM
+    ranking_score: float | None = None        # best sample ranking
+    all_ptm: torch.Tensor | None = None       # [K] all samples' pTM
+    all_ranking: torch.Tensor | None = None   # [K] all samples' ranking
+    fallback_level: int = 0                   # 0=normal, 1=df, 2=modes, 3=alpha
+    num_samples: int = 1                      # K diffusion samples used
 
 
 @dataclass
@@ -456,8 +484,28 @@ class ModeDrivePipeline:
         z_mod = self._blend_z(z_pseudo, zij_trunk)
 
         # Run diffusion if available, otherwise use displaced as proxy
+        plddt_out = None
+        ptm_out = None
+        ranking_out = None
+        all_ptm_out = None
+        all_ranking_out = None
+        num_samples_out = 1
+
         if self.diffusion_fn is not None:
-            new_ca = self.diffusion_fn(z_mod)
+            diff_result = self.diffusion_fn(z_mod)
+            if DiffusionResult is not None and isinstance(diff_result, DiffusionResult):
+                new_ca = diff_result.best_ca
+                num_samples_out = diff_result.all_ca.shape[0]
+                if diff_result.plddt is not None:
+                    plddt_out = diff_result.plddt[diff_result.best_idx]
+                if diff_result.ptm is not None:
+                    ptm_out = diff_result.ptm[diff_result.best_idx].item()
+                    all_ptm_out = diff_result.ptm
+                if diff_result.ranking is not None:
+                    ranking_out = diff_result.ranking[diff_result.best_idx].item()
+                    all_ranking_out = diff_result.ranking
+            else:
+                new_ca = diff_result
         else:
             new_ca = displaced
 
@@ -475,6 +523,12 @@ class ModeDrivePipeline:
             eigenvectors=eigenvectors,
             b_factors=b_factors,
             df_used=df_used,
+            plddt=plddt_out,
+            ptm=ptm_out,
+            ranking_score=ranking_out,
+            all_ptm=all_ptm_out,
+            all_ranking=all_ranking_out,
+            num_samples=num_samples_out,
         )
 
     @torch.no_grad()
@@ -599,6 +653,86 @@ class ModeDrivePipeline:
 
         return best_overall
 
+    def _confidence_ok(self, result: StepResult) -> bool:
+        """Check if step result passes confidence cutoffs."""
+        cfg = self.config
+        if result.ranking_score is not None:
+            return result.ranking_score >= cfg.confidence_ranking_cutoff
+        # No confidence data → pass by default
+        return True
+
+    @torch.no_grad()
+    def step_with_fallback(
+        self,
+        coords_ca: torch.Tensor,
+        initial_coords_ca: torch.Tensor,
+        zij_trunk: torch.Tensor,
+        prev_rmsd: float = 0.0,
+        target_coords: torch.Tensor | None = None,
+    ) -> StepResult:
+        """Run step with confidence-guided adaptive fallback.
+
+        Fallback levels:
+            0: Normal step (original params)
+            1: Reduce df by fallback_df_factor
+            2: Reduce max_combo_size to fallback_max_combo_size (single mode)
+            3: Reduce z_mixing_alpha by fallback_alpha_factor
+
+        If all levels fail, returns the attempt with highest ranking score.
+        """
+        cfg = self.config
+
+        # Save originals
+        orig_df = cfg.df
+        orig_df_min = cfg.df_min
+        orig_max_combo = cfg.max_combo_size
+        orig_alpha = cfg.z_mixing_alpha
+
+        best_result: StepResult | None = None
+        best_ranking = -1.0
+
+        for level in range(cfg.max_fallback_retries + 1):
+            if level == 1:
+                # Fallback L1: reduce df
+                cfg.df = orig_df * cfg.fallback_df_factor
+                cfg.df_min = orig_df_min * cfg.fallback_df_factor
+            elif level == 2:
+                # Fallback L2: single mode (+ keep reduced df)
+                cfg.max_combo_size = cfg.fallback_max_combo_size
+            elif level == 3:
+                # Fallback L3: reduce alpha (+ keep reduced df + single mode)
+                cfg.z_mixing_alpha = orig_alpha * cfg.fallback_alpha_factor
+
+            result = self.step(
+                coords_ca, initial_coords_ca, zij_trunk,
+                prev_rmsd, target_coords,
+            )
+            result.fallback_level = level
+
+            # Track best attempt by ranking
+            r_score = result.ranking_score if result.ranking_score is not None else 0.0
+            if r_score > best_ranking:
+                best_ranking = r_score
+                best_result = result
+
+            if self._confidence_ok(result):
+                # Restore config and return
+                cfg.df = orig_df
+                cfg.df_min = orig_df_min
+                cfg.max_combo_size = orig_max_combo
+                cfg.z_mixing_alpha = orig_alpha
+                return result
+
+        # Restore config
+        cfg.df = orig_df
+        cfg.df_min = orig_df_min
+        cfg.max_combo_size = orig_max_combo
+        cfg.z_mixing_alpha = orig_alpha
+
+        # Forced accept: best attempt
+        assert best_result is not None
+        return best_result
+
     @torch.no_grad()
     def run(
         self,
@@ -630,14 +764,22 @@ class ModeDrivePipeline:
         z_current = zij_trunk
         prev_rmsd = 0.0  # initial RMSD from self = 0
 
+        use_fallback = cfg.enable_confidence_fallback
+
         if verbose:
             N = initial_coords_ca.shape[0]
             has_target = target_coords is not None
             header = f"{'Step':>6} {'RMSD_init':>10} {'df':>6} {'Combo':>20}"
             if has_target:
                 header += f" {'RMSD_tgt':>10} {'TM_tgt':>8}"
+            header += f" {'pTM':>6} {'pLDDT':>6} {'FB':>3}"
             print(f"\n{'='*len(header)}")
-            print(f"Mode-Drive Pipeline | N={N} | strategy={cfg.combination_strategy} | n_steps={cfg.n_steps} | z_dir={cfg.z_direction}")
+            fb_str = "ON" if use_fallback else "OFF"
+            print(
+                f"Mode-Drive Pipeline | N={N} | strategy={cfg.combination_strategy} "
+                f"| n_steps={cfg.n_steps} | z_dir={cfg.z_direction} | "
+                f"K={cfg.num_diffusion_samples} | fallback={fb_str}"
+            )
             print(f"{'='*len(header)}")
             print(header)
             print(f"{'-'*len(header)}")
@@ -648,19 +790,33 @@ class ModeDrivePipeline:
                 rmsd_tgt = compute_rmsd(initial_coords_ca, target_coords)
                 tm_tgt = tm_score(initial_coords_ca, target_coords)
                 init_line += f" {rmsd_tgt:>10.3f} {tm_tgt:>8.4f}"
+            init_line += f" {'—':>6} {'—':>6} {'—':>3}"
             print(init_line)
 
         for step_idx in range(cfg.n_steps):
-            step_result = self.step(
-                coords_ca, initial_coords_ca, z_current,
-                prev_rmsd, target_coords,
-            )
+            if use_fallback:
+                step_result = self.step_with_fallback(
+                    coords_ca, initial_coords_ca, z_current,
+                    prev_rmsd, target_coords,
+                )
+            else:
+                step_result = self.step(
+                    coords_ca, initial_coords_ca, z_current,
+                    prev_rmsd, target_coords,
+                )
             result.step_results.append(step_result)
             result.trajectory.append(step_result.new_ca.clone())
             result.total_steps = step_idx + 1
 
             if verbose:
                 combo_label = step_result.combo.label[:20]
+                ptm_str = f"{step_result.ptm:.3f}" if step_result.ptm is not None else "—"
+                plddt_str = (
+                    f"{step_result.plddt.mean().item():.3f}"
+                    if step_result.plddt is not None else "—"
+                )
+                fb_str = str(step_result.fallback_level) if step_result.fallback_level > 0 else "—"
+
                 line = (
                     f"{step_idx+1:>6} "
                     f"{step_result.rmsd:>10.3f} "
@@ -671,6 +827,7 @@ class ModeDrivePipeline:
                     rmsd_t = compute_rmsd(step_result.new_ca, target_coords)
                     tm_t = tm_score(step_result.new_ca, target_coords)
                     line += f" {rmsd_t:>10.3f} {tm_t:>8.4f}"
+                line += f" {ptm_str:>6} {plddt_str:>6} {fb_str:>3}"
                 print(line)
 
             # Update for next step
@@ -685,6 +842,14 @@ class ModeDrivePipeline:
             if has_target:
                 final_tm = tm_score(result.step_results[-1].new_ca, target_coords)
                 print(f"Final TM-score vs target: {final_tm:.4f}")
+
+            # Confidence summary
+            ptms = [r.ptm for r in result.step_results if r.ptm is not None]
+            if ptms:
+                print(f"pTM range: {min(ptms):.3f} — {max(ptms):.3f}")
+            fallbacks = [r.fallback_level for r in result.step_results if r.fallback_level > 0]
+            if fallbacks:
+                print(f"Fallback triggered: {len(fallbacks)}/{len(result.step_results)} steps (levels: {fallbacks})")
             print()
 
         return result
