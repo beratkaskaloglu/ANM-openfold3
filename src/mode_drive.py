@@ -53,7 +53,7 @@ class ModeDriveConfig:
 
     # Pipeline parameters
     n_steps: int = 5                             # fixed number of steps (no early stop)
-    combination_strategy: str = "collectivity"  # "collectivity", "grid", "random", "targeted"
+    combination_strategy: str = "collectivity"  # "collectivity", "grid", "random", "targeted", "manual"
     n_combinations: int = 20
     z_mixing_alpha: float = 0.3
     normalize_z: bool = True
@@ -65,6 +65,9 @@ class ModeDriveConfig:
     df_max: float = 3.0                          # maximum df
     df_escalation_factor: float = 1.5            # multiply df when combos exhausted
     max_combo_size: int = 3                      # max modes per combination (e.g. 3 or 5)
+
+    # Manual mode selection
+    manual_modes: tuple[int, ...] = ()           # e.g. (0, 1, 2) — mode indices to use
 
     # Random combinator defaults
     select_modes_range: tuple[int, int] = (1, 5)
@@ -341,6 +344,8 @@ class ModeDrivePipeline:
                 df_steps=cfg.grid_df_steps,
                 max_combos=cfg.n_combinations,
             )
+        elif cfg.combination_strategy == "manual":
+            return self._manual_combo(eigenvalues, df)
         elif cfg.combination_strategy == "targeted":
             if target_coords is None:
                 raise ValueError("targeted strategy requires target_coords")
@@ -359,6 +364,31 @@ class ModeDrivePipeline:
                 df_scale=cfg.df_scale,
                 eigenvalues=eigenvalues,
             )
+
+    def _manual_combo(
+        self,
+        eigenvalues: torch.Tensor,
+        df: float,
+    ) -> list[ModeCombo]:
+        """Build a single combo from user-specified modes.
+
+        Eigenvalue-weighted normalize + single global df.
+        Returns one combo (the specified modes with normalized df).
+        """
+        modes = self.config.manual_modes
+        if not modes:
+            raise ValueError("manual strategy requires manual_modes to be set")
+
+        amp = 1.0 / (eigenvalues[list(modes)].sqrt() + 1e-10)
+        amp = amp / (amp.sum() + 1e-10)
+        mode_dfs = tuple((df * amp).tolist())
+
+        label = f"manual_m{'_'.join(map(str, modes))}"
+        return [ModeCombo(
+            mode_indices=modes,
+            dfs=mode_dfs,
+            label=label,
+        )]
 
     def _blend_z(
         self,
