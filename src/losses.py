@@ -171,16 +171,20 @@ def reconstruction_loss(
     z_original: torch.Tensor,
     z_reconstructed: torch.Tensor,
 ) -> torch.Tensor:
-    """Autoencoder reconstruction loss (stabilises inverse path).
+    """Inverse reconstruction loss (normalised to unit variance).
+
+    Divides both tensors by z_original's std before MSE so the loss
+    stays O(1) regardless of pair representation magnitude (~100 for OF3).
 
     Args:
-        z_original:      [B, N, N, c_z] symmetrised pair repr.
-        z_reconstructed: [B, N, N, c_z] encode → decode output.
+        z_original:      [N, N, c_z] symmetrised pair repr.
+        z_reconstructed: [N, N, c_z] inverse output.
 
     Returns:
-        Scalar MSE loss.
+        Scalar normalised MSE loss.
     """
-    return F.mse_loss(z_reconstructed, z_original)
+    scale = z_original.std().clamp(min=1e-4)
+    return F.mse_loss(z_reconstructed / scale, z_original / scale)
 
 
 def total_loss(
