@@ -23,6 +23,7 @@ Anisotropic Network Model (ANM) tabanli protein dinamik analizi ile OpenFold3 ya
 
 ### Modules
 - [[modules/anm-mode-drive]] - ANM Mode-Drive modul referansi ve API
+- [[modules/autostop-adapter]] - Autostop adapter: IW-ENM MD + early-stop monitor bridge
 - [[modules/input-embedder]] - Input Embedder detaylari
 - [[modules/msa-module]] - MSA Module detaylari
 - [[modules/pairformer]] - PairFormer detaylari

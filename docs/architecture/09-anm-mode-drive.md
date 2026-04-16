@@ -372,6 +372,138 @@ RMSD: 0 → 1.2 → 1.5 → 1.8 Å (monoton artan)
 
 ---
 
+## 12. Autostop Stratejisi (IW-ENM MD + Early-Stop Picker)
+
+`combination_strategy="autostop"` — ANM mod-kombinasyon deplasmaninin **alternatifi**. Downstream (contact → z → blend → OF3 → confidence) aynen korunur; sadece deplasman kaynagi degisir.
+
+### 12.1 Temel Fikir
+
+ANM tek bir lineer deplasmana dayanir (`Σ_k v_k · df_k`). Autostop ise **kisa bir Interaction-Weighted Elastic Network Model (IW-ENM) MD** simulasyonu calistirir:
+
+```
+start_ca ──►  IW-ENM velocity-Verlet
+              ──► her save_every adimda (E_tot, n_springs, crash_count)
+              ──► Early-stop monitor: E/n_springs reversal + crash-onset
+              ──► "turnpoint" frame ─ back_off = picked_ca
+```
+
+Fikir: fiziksel olarak anlamli (pack count + sidechain volume agirlikli) bir network ile kisa MD, modda bulunamayan **non-linear bukulmeleri** yakalar. Monitor, yapinin "kirilma"ya basladigi ani tespit edip `back_off` kadar geri donup stabil bir frame secer.
+
+### 12.2 Erken Durma Kriterleri
+
+Monitor her save-indeks `k`'te 3 sinyali takip eder (smooth window = `smooth_w`):
+
+1. **Energy reversal:** `argmin_E_k` bulundu ve `patience` adim boyunca `|ΔE|/|E| < eps_E_rel` → toplam enerji dalgalaniyor → turnpoint.
+2. **Spring-count reversal:** `argmin_N_k` bulundu ve `|Δn_springs|/n < eps_N_rel` patience boyunca → ag baglantililigi daraldi ve sabitlendi.
+3. **Crash onset:** `crash_window_saves` icinde `>= crash_threshold` tane residue-residue crash (< `R_sc`) → yapisal cokme basladi.
+
+Herhangi biri tetiklenirse: `turn_k = min(argmin_E_k, argmin_N_k)`, `picked_save_index = max(0, turn_k - back_off)`.
+
+### 12.3 Adaptif Fallback Merdiveni (L0-L9)
+
+Confidence (pTM/pLDDT) dusuk ciktiysa, monitor knoblari yeniden ayarlanir. **Cache-replay** seviyeleri (L1/L3/L4/L5/L6/L8) MD'yi tekrar calistirmaz; cached `AutostopTrace.trajectory` uzerinde sadece monitor yeniden yurutulur.
+
+| Seviye | Ne degisir? | Re-integrate? |
+|--------|-------------|---------------|
+| L0 | Baseline — olduğu gibi calistir | — (ilk MD) |
+| L1 | `back_off += Δ` (monitor-only) | hayir |
+| L2 | `v_magnitude *= scale` | **evet** (yeni MD) |
+| L3 | `eps_E/eps_N *= scale` | hayir |
+| L4 | `z_mixing_alpha *= scale` | hayir |
+| L5 | `patience += Δ` | hayir |
+| L6 | `smooth_w += Δ` | hayir |
+| L7 | `v × back_off × alpha` grid | **evet** (yeni MD per hücre) |
+| L8 | monitor-knob grid (cap=8) | hayir |
+| L9 | Forced-accept best-so-far | — |
+
+> Not: L7 grid hücre sayisi `autostop_fallback_grid_cap` ile sinirlandirilir.
+
+### 12.4 Konfigurasyon
+
+Tum autostop parametreleri `ModeDriveConfig` icinde `autostop_*` prefix'i ile bulunur — bkz. [[#13. Konfigurasyon Referans Tablosu]] ve [[modules/autostop-adapter]].
+
+### 12.5 Kullanim Ornegi
+
+```python
+from src.autostop_adapter import StructureContext
+from src.mode_drive import ModeDriveConfig, ModeDrivePipeline
+
+structure_ctx = StructureContext.from_pdb("1ake.pdb", chain_id="A")
+
+config = ModeDriveConfig(
+    combination_strategy="autostop",
+    autostop_n_steps=5000, autostop_save_every=10,
+    autostop_back_off=2, autostop_v_mode="breathing",
+    autostop_warmup_frac=0.40, autostop_patience=3,
+    autostop_eps_E_rel=0.0002, autostop_eps_N_rel=0.0005,
+    autostop_crash_window_saves=20, autostop_crash_threshold=5,
+    autostop_fallback_levels=(0,1,2,3,4,5,6,7,8,9),
+)
+pipeline = ModeDrivePipeline(
+    converter, config, diffusion_fn=diffusion_fn, structure_ctx=structure_ctx,
+)
+result = pipeline.run(initial_coords_ca, zij_trunk)
+```
+
+### 12.6 Cikti
+
+Autostop ile her `StepResult` uzerinde ek alan:
+
+```python
+step.autostop_info = {
+    "picked_save_index": int,    # secilen save indeksi
+    "picked_step_md":    int,    # raw MD step
+    "turn_k":            int,    # turnpoint save-k
+    "argmin_E_k":        int,
+    "argmin_N_k":        int,
+    "stop_step_md":      int | None,  # monitor tetiklendiyse
+    "crashes_total":     int,
+    "back_off_used":     int,
+    "monitor_params":    dict,   # uygulanan monitor knoblari
+    "stop_reason":       str | None,
+    "fallback_level":    int,
+    "n_saves":           int,
+    "total_mdsteps_requested": int,
+    "save_every":        int,
+}
+```
+
+Ayrica `pipeline._autostop_last_trace` son MD'nin cache'ini tutar (`E_tot`, `n_springs`, `crashes_cum_at_save`, `trajectory`).
+
+---
+
+## 13. Autostop Konfigurasyon Referansi
+
+| Parametre | Varsayilan | Aciklama |
+|-----------|------------|----------|
+| `autostop_R_bb` | 11.0 Å | Backbone contact cutoff (spring baglanti) |
+| `autostop_R_sc` | 2.0 Å | Sidechain crash cutoff |
+| `autostop_K_0` | 0.8 | Base spring constant |
+| `autostop_d_0` | 3.8 Å | Equilibrium bond length |
+| `autostop_n_ref` | 10.0 | Reference interaction count |
+| `autostop_dt` | 0.01 | MD time step |
+| `autostop_mass` | 1.0 | Uniform atom mass |
+| `autostop_damping` | 0.0 | Velocity-Verlet damping |
+| `autostop_v_mode` | "breathing" | Initial velocity mode ("breathing"/"random"/"mode") |
+| `autostop_v_magnitude` | 1.0 | Initial velocity magnitude |
+| `autostop_n_steps` | 5000 | Toplam MD adimi |
+| `autostop_save_every` | 10 | Save interval |
+| `autostop_back_off` | 2 | Turnpoint'ten geri sayi (saves) |
+| `autostop_crash_threshold_distance` | 0.5 Å | Residue-residue crash mesafesi |
+| `autostop_smooth_w` | 11 | Moving-average pencere |
+| `autostop_warmup_frac` | 0.40 | Monitor baslama warm-up orani |
+| `autostop_patience` | 3 | Reversal icin patience |
+| `autostop_eps_E_rel` | 0.0002 | E reversal toleransi |
+| `autostop_eps_N_rel` | 0.0005 | n_springs reversal toleransi |
+| `autostop_crash_window_saves` | 20 | Crash onset window |
+| `autostop_crash_threshold` | 5 | Crash onset threshold |
+| `autostop_verbose` | True | Monitor loglama |
+| `autostop_fallback_levels` | `(0..9)` | Aktif fallback seviyeleri |
+| `autostop_fallback_*_scales/adds/deltas` | — | Seviye basina knob mutasyonu |
+| `autostop_fallback_grid_cap` | 8 | L7/L8 grid hucre limit |
+
+---
+
 ## Iliskili Dokumanlar
 
 - [[08-anm-theory]] — ANM matematigi: Hessian, eigendecomposition, collectivity
@@ -379,4 +511,6 @@ RMSD: 0 → 1.2 → 1.5 → 1.8 Å (monoton artan)
 - [[05-gnm-contact-learner]] — ContactProjectionHead (z ↔ C, inverse path)
 - [[06-gnm-math-detail]] — GNM Kirchhoff
 - [[03-data-flow]] — OF3 veri akisi
+- [[13-confidence-guided-pipeline]] — Adaptive fallback (autostop L0-L9 analogu)
+- [[modules/autostop-adapter]] — Autostop adapter API ve data flow
 - [[modules/anm-mode-drive]] — Modul API referansi

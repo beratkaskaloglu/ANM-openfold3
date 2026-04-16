@@ -108,6 +108,57 @@ class ModeDriveConfig:
     fallback_extended_df_scales: tuple[float, ...] = (0.5, 0.25)   # df multipliers
     fallback_extended_alpha_scales: tuple[float, ...] = (0.5, 0.25)  # alpha multipliers
 
+    # ─────────────── Autostop strategy ───────────────
+    # Replaces ANM mode-combo displacement with IW-ENM MD + early-stop picker.
+    # Downstream (coords → contact → z_pseudo → blend → OF3 → QC) is unchanged.
+    autostop_chain_id: str = "A"
+    # Physics
+    autostop_R_bb: float = 11.0
+    autostop_R_sc: float = 2.0
+    autostop_K_0: float = 0.8
+    autostop_d_0: float = 3.8
+    autostop_n_ref: float = 10.0
+    # Integration
+    autostop_dt: float = 0.01
+    autostop_mass: float = 1.0
+    autostop_damping: float = 0.0
+    autostop_v_mode: str = "breathing"
+    autostop_v_magnitude: float = 1.0
+    # Run control
+    autostop_n_steps: int = 5000
+    autostop_save_every: int = 10
+    autostop_back_off: int = 2
+    autostop_crash_threshold_distance: float = 0.5
+    # Monitor (early-stop)
+    autostop_smooth_w: int = 11
+    autostop_warmup_frac: float = 0.40
+    autostop_patience: int = 3
+    autostop_eps_E_rel: float = 0.0002
+    autostop_eps_N_rel: float = 0.0005
+    autostop_crash_window_saves: int = 20
+    autostop_crash_threshold: int = 5
+    autostop_min_saves_before_check: int = 15
+    autostop_verbose: bool = True
+
+    # Autostop fallback ladder (L0-L9).
+    # See docs/plans/autostop_integration.md §2.4.
+    # Per-level scale / delta sweeps; each entry is a NEW mutation relative to
+    # the BASELINE config value (not cumulative across levels).
+    autostop_fallback_v_scales: tuple[float, ...] = (1.0, 0.5, 0.25, 0.1)
+    autostop_fallback_back_off_adds: tuple[int, ...] = (0, 2, 4, 8)
+    autostop_fallback_eps_E_scales: tuple[float, ...] = (1.0, 2.0, 0.5, 0.25)
+    autostop_fallback_eps_N_scales: tuple[float, ...] = (1.0, 2.0, 0.5, 0.25)
+    autostop_fallback_patience_deltas: tuple[int, ...] = (0, -1, 1, 2)
+    autostop_fallback_smooth_w_deltas: tuple[int, ...] = (0, 4, -2, 8)
+    autostop_fallback_warmup_frac_scales: tuple[float, ...] = (1.0, 1.5, 0.5)
+    autostop_fallback_crash_window_scales: tuple[float, ...] = (1.0, 2.0, 0.5)
+    autostop_fallback_crash_threshold_adds: tuple[int, ...] = (0, 2, -2)
+    autostop_fallback_alpha_scales: tuple[float, ...] = (1.0, 0.5, 0.25)  # L4/L7 z_mixing_alpha multipliers
+    # Which L0-L9 levels to enable (default: all).
+    autostop_fallback_levels: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
+    # Max cells per extended grid (L7, L8) — prevents combinatorial blow-up.
+    autostop_fallback_grid_cap: int = 8
+
 
 @dataclass
 class StepResult:
@@ -134,6 +185,9 @@ class StepResult:
     fallback_level: int = 0                   # 0=normal, 1=df, 2=modes, 3=alpha
     rejected: bool = False                    # True if all fallback levels failed (forced-accept)
     num_samples: int = 1                      # K diffusion samples used
+
+    # Autostop strategy diagnostics (None when strategy != "autostop")
+    autostop_info: dict | None = None
 
 
 @dataclass
@@ -348,10 +402,17 @@ class ModeDrivePipeline:
         converter: PairContactConverter,
         config: ModeDriveConfig | None = None,
         diffusion_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        structure_ctx=None,  # autostop_adapter.StructureContext | None — lazy-typed to avoid importing iw_enm unless autostop is actually used
     ) -> None:
         self.converter = converter
         self.config = config or ModeDriveConfig()
         self.diffusion_fn = diffusion_fn
+        self.structure_ctx = structure_ctx
+
+        # Cache of most-recent autostop trace for cheap fallback replay.
+        # Only populated when combination_strategy == "autostop".
+        self._autostop_last_trace = None
+        self._autostop_last_coords_key: int | None = None
 
     def _generate_combos(
         self,
@@ -465,12 +526,11 @@ class ModeDrivePipeline:
         b_factors: torch.Tensor,
         df_used: float,
     ) -> StepResult:
-        """Evaluate a single mode combination.
+        """Evaluate a single mode combination (ANM displace → downstream).
 
         RMSD is computed from initial_coords_ca (not current iteration),
         because higher RMSD = more conformational exploration = better.
         """
-        cfg = self.config
         device = coords_ca.device
 
         # Select modes
@@ -481,6 +541,36 @@ class ModeDrivePipeline:
 
         # Displace from current coords (eigenvalue-weighted)
         displaced = displace(coords_ca, modes_sel, dfs, eigenvalues=eig_sel)
+
+        return self._downstream_from_displaced(
+            combo=combo,
+            displaced=displaced,
+            initial_coords_ca=initial_coords_ca,
+            zij_trunk=zij_trunk,
+            eigenvalues=eigenvalues,
+            eigenvectors=eigenvectors,
+            b_factors=b_factors,
+            df_used=df_used,
+        )
+
+    def _downstream_from_displaced(
+        self,
+        combo: ModeCombo,
+        displaced: torch.Tensor,
+        initial_coords_ca: torch.Tensor,
+        zij_trunk: torch.Tensor,
+        eigenvalues: torch.Tensor,
+        eigenvectors: torch.Tensor,
+        b_factors: torch.Tensor,
+        df_used: float,
+        autostop_info: dict | None = None,
+    ) -> StepResult:
+        """Common downstream path from a displaced-CA tensor.
+
+        Shared by ANM-combo strategies and the autostop strategy:
+        displaced → contact → z_pseudo → blend → diffusion → StepResult.
+        """
+        cfg = self.config
 
         # Contact map from displaced coordinates
         contact = coords_to_contact(
@@ -540,6 +630,134 @@ class ModeDrivePipeline:
             all_ptm=all_ptm_out,
             all_ranking=all_ranking_out,
             num_samples=num_samples_out,
+            autostop_info=autostop_info,
+        )
+
+    # ─────────────── Autostop strategy ───────────────
+
+    def _autostop_params(self):
+        """Build AutostopParams dataclass from current config values.
+
+        Reads the *current* config fields — so fallback mutations (which
+        patch config in place under try/finally) are picked up automatically.
+        """
+        from .autostop_adapter import AutostopParams
+        cfg = self.config
+        return AutostopParams(
+            R_bb=cfg.autostop_R_bb,
+            R_sc=cfg.autostop_R_sc,
+            K_0=cfg.autostop_K_0,
+            d_0=cfg.autostop_d_0,
+            n_ref=cfg.autostop_n_ref,
+            dt=cfg.autostop_dt,
+            mass=cfg.autostop_mass,
+            damping=cfg.autostop_damping,
+            v_mode=cfg.autostop_v_mode,
+            v_magnitude=cfg.autostop_v_magnitude,
+            n_steps=cfg.autostop_n_steps,
+            save_every=cfg.autostop_save_every,
+            back_off=cfg.autostop_back_off,
+            crash_threshold_distance=cfg.autostop_crash_threshold_distance,
+            smooth_w=max(3, cfg.autostop_smooth_w),
+            warmup_frac=max(0.0, min(0.5, cfg.autostop_warmup_frac)),
+            patience=max(1, cfg.autostop_patience),
+            eps_E_rel=max(1e-6, cfg.autostop_eps_E_rel),
+            eps_N_rel=max(1e-6, cfg.autostop_eps_N_rel),
+            crash_window_saves=max(1, cfg.autostop_crash_window_saves),
+            crash_threshold=max(1, cfg.autostop_crash_threshold),
+            min_saves_before_check=max(1, cfg.autostop_min_saves_before_check),
+            verbose=cfg.autostop_verbose,
+        )
+
+    def _autostop_synthetic_combo(
+        self,
+        step_idx: int,
+        picked_step: int,
+        turn_k: int,
+    ) -> ModeCombo:
+        """Build a placeholder ModeCombo for autostop results.
+
+        Contains no ANM modes — just a descriptive label so downstream
+        code (notebook tables, StepResult serialization) keeps working.
+        """
+        return ModeCombo(
+            mode_indices=(),
+            dfs=(),
+            label=f"autostop_s{step_idx}_pk{picked_step}_tk{turn_k}",
+            collectivity_score=0.0,
+        )
+
+    def _autostop_step(
+        self,
+        coords_ca: torch.Tensor,
+        initial_coords_ca: torch.Tensor,
+        zij_trunk: torch.Tensor,
+        step_idx: int = 0,
+    ) -> StepResult:
+        """Run one autostop MD + downstream evaluation.
+
+        ANM modes are still computed (same cost as other strategies) so
+        StepResult eigenvalues/eigenvectors/b_factors fields remain
+        populated for notebook plots — but autostop does NOT use them
+        for displacement.
+        """
+        from .autostop_adapter import run_autostop_from_tensor
+
+        if self.structure_ctx is None:
+            raise RuntimeError(
+                "combination_strategy='autostop' requires a StructureContext. "
+                "Pass structure_ctx=StructureContext.from_pdb(...) or "
+                "StructureContext.from_ca_only(coords_ca, res_names=...) to "
+                "ModeDrivePipeline(...)."
+            )
+
+        cfg = self.config
+
+        # Compute ANM modes — kept for diagnostics (plots), not for displacement
+        H = build_hessian(coords_ca, cfg.anm_cutoff, cfg.anm_gamma, cfg.anm_tau)
+        eigenvalues, eigenvectors = anm_modes(H, cfg.n_anm_modes)
+        b_factors = anm_bfactors(eigenvalues, eigenvectors)
+
+        # Run autostop — cache the trace for possible fallback replay
+        params = self._autostop_params()
+        pick, trace = run_autostop_from_tensor(coords_ca, self.structure_ctx, params)
+        self._autostop_last_trace = trace
+        self._autostop_last_coords_key = id(coords_ca)
+
+        combo = self._autostop_synthetic_combo(
+            step_idx=step_idx,
+            picked_step=pick.picked_step_md,
+            turn_k=pick.turn_k,
+        )
+
+        autostop_info = {
+            "picked_save_index": pick.picked_save_index,
+            "picked_step_md": pick.picked_step_md,
+            "turn_k": pick.turn_k,
+            "argmin_E_k": pick.argmin_E_k,
+            "argmin_N_k": pick.argmin_N_k,
+            "stop_step_md": pick.stop_step_md,
+            "crashes_total": pick.crashes_total,
+            "back_off_used": pick.back_off_used,
+            "monitor_params": dict(pick.monitor_params),
+            "stop_reason": pick.stop_reason,
+            "n_saves": int(len(trace.steps)),
+            "total_mdsteps_requested": trace.total_mdsteps_requested,
+            "save_every": trace.save_every,
+        }
+
+        # df_used is 0.0 for autostop (no mode displacement factor).
+        # alpha_used is read by downstream from current cfg (already set).
+        return self._downstream_from_displaced(
+            combo=combo,
+            displaced=pick.picked_ca,
+            initial_coords_ca=initial_coords_ca,
+            zij_trunk=zij_trunk,
+            eigenvalues=eigenvalues,
+            eigenvectors=eigenvectors,
+            b_factors=b_factors,
+            df_used=0.0,
+            autostop_info=autostop_info,
         )
 
     @torch.no_grad()
@@ -572,6 +790,16 @@ class ModeDrivePipeline:
             StepResult with best combination's outputs.
         """
         cfg = self.config
+
+        # Autostop strategy — completely bypasses ANM mode-combo displacement.
+        # Downstream (contact → z_pseudo → blend → diffusion → QC) unchanged.
+        if cfg.combination_strategy == "autostop":
+            return self._autostop_step(
+                coords_ca=coords_ca,
+                initial_coords_ca=initial_coords_ca,
+                zij_trunk=zij_trunk,
+                step_idx=0,
+            )
 
         # Step 1: ANM Hessian + Eigendecomposition
         H = build_hessian(coords_ca, cfg.anm_cutoff, cfg.anm_gamma, cfg.anm_tau)
@@ -718,6 +946,15 @@ class ModeDrivePipeline:
         """
         cfg = self.config
 
+        # Dispatch to autostop-specific ladder when strategy=autostop.
+        if cfg.combination_strategy == "autostop":
+            return self.step_with_autostop_fallback(
+                coords_ca=coords_ca,
+                initial_coords_ca=initial_coords_ca,
+                zij_trunk=zij_trunk,
+                step_idx=0,
+            )
+
         # Save originals
         orig_df = cfg.df
         orig_df_min = cfg.df_min
@@ -830,6 +1067,367 @@ class ModeDrivePipeline:
             cfg.df = orig_df
             cfg.df_min = orig_df_min
             cfg.max_combo_size = orig_max_combo
+            cfg.z_mixing_alpha = orig_alpha
+
+    # ─────────────── Autostop fallback ladder (L0-L9) ───────────────
+
+    def _autostop_downstream_from_pick(
+        self,
+        pick,
+        initial_coords_ca: torch.Tensor,
+        zij_trunk: torch.Tensor,
+        eigenvalues: torch.Tensor,
+        eigenvectors: torch.Tensor,
+        b_factors: torch.Tensor,
+        step_idx: int,
+        fallback_level: int,
+        trace_stats: dict,
+    ) -> StepResult:
+        """Build a StepResult from an autostop pick — reused across fallback levels."""
+        combo = self._autostop_synthetic_combo(
+            step_idx=step_idx,
+            picked_step=pick.picked_step_md,
+            turn_k=pick.turn_k,
+        )
+        autostop_info = {
+            "picked_save_index": pick.picked_save_index,
+            "picked_step_md": pick.picked_step_md,
+            "turn_k": pick.turn_k,
+            "argmin_E_k": pick.argmin_E_k,
+            "argmin_N_k": pick.argmin_N_k,
+            "stop_step_md": pick.stop_step_md,
+            "crashes_total": pick.crashes_total,
+            "back_off_used": pick.back_off_used,
+            "monitor_params": dict(pick.monitor_params),
+            "stop_reason": pick.stop_reason,
+            "fallback_level": fallback_level,
+            **trace_stats,
+        }
+        result = self._downstream_from_displaced(
+            combo=combo,
+            displaced=pick.picked_ca,
+            initial_coords_ca=initial_coords_ca,
+            zij_trunk=zij_trunk,
+            eigenvalues=eigenvalues,
+            eigenvectors=eigenvectors,
+            b_factors=b_factors,
+            df_used=0.0,
+            autostop_info=autostop_info,
+        )
+        result.fallback_level = fallback_level
+        return result
+
+    @torch.no_grad()
+    def step_with_autostop_fallback(
+        self,
+        coords_ca: torch.Tensor,
+        initial_coords_ca: torch.Tensor,
+        zij_trunk: torch.Tensor,
+        step_idx: int = 0,
+    ) -> StepResult:
+        """Run autostop strategy with L0-L9 confidence-guided fallback.
+
+        Levels (see docs/plans/autostop_integration.md §2.4):
+            L0: baseline autostop                                (MD + monitor + ds)
+            L1: back_off adds  — replay_monitor                  (no MD)
+            L2: v_magnitude scales — re-run MD                   (RERUN)
+            L3: eps_E/eps_N scales — replay_monitor              (no MD)
+            L4: z_alpha scales — re-run downstream only          (no MD, no monitor)
+            L5: patience deltas — replay_monitor                 (no MD)
+            L6: smooth_w deltas — replay_monitor                 (no MD)
+            L7: grid (v × back_off × alpha) — re-run MD          (RERUN; capped)
+            L8: grid (eps_E × eps_N × patience × smooth_w)       (no MD; capped)
+            L9: skip — forced-accept best-so-far
+
+        `cfg.autostop_fallback_levels` subsets which levels are attempted.
+        """
+        from .autostop_adapter import AutostopParams, run_autostop_from_tensor, replay_monitor
+
+        if self.structure_ctx is None:
+            raise RuntimeError(
+                "combination_strategy='autostop' with fallback requires a StructureContext."
+            )
+
+        cfg = self.config
+
+        # Save originals for try/finally restoration — includes autostop knobs
+        # touched by mutations and z_mixing_alpha touched by L4/L7.
+        orig_v = cfg.autostop_v_magnitude
+        orig_back = cfg.autostop_back_off
+        orig_eps_E = cfg.autostop_eps_E_rel
+        orig_eps_N = cfg.autostop_eps_N_rel
+        orig_patience = cfg.autostop_patience
+        orig_smooth_w = cfg.autostop_smooth_w
+        orig_warmup = cfg.autostop_warmup_frac
+        orig_crash_win = cfg.autostop_crash_window_saves
+        orig_crash_thr = cfg.autostop_crash_threshold
+        orig_alpha = cfg.z_mixing_alpha
+
+        best_result: StepResult | None = None
+        best_ranking = -1.0
+
+        def _track(result: StepResult) -> bool:
+            nonlocal best_result, best_ranking
+            r_score = result.ranking_score if result.ranking_score is not None else 0.0
+            if r_score > best_ranking:
+                best_ranking = r_score
+                best_result = result
+            return self._confidence_ok(result)
+
+        # Compute ANM modes once for diagnostics — same cost as _autostop_step
+        H = build_hessian(coords_ca, cfg.anm_cutoff, cfg.anm_gamma, cfg.anm_tau)
+        eigenvalues, eigenvectors = anm_modes(H, cfg.n_anm_modes)
+        b_factors = anm_bfactors(eigenvalues, eigenvectors)
+
+        device = coords_ca.device
+        dtype = coords_ca.dtype
+        enabled = set(cfg.autostop_fallback_levels)
+
+        # Will be populated by L0 and reused by cheap levels.
+        trace = None
+
+        def _trace_stats(tr) -> dict:
+            return {
+                "n_saves": int(len(tr.steps)),
+                "total_mdsteps_requested": tr.total_mdsteps_requested,
+                "save_every": tr.save_every,
+            }
+
+        def _run_md(params: AutostopParams):
+            nonlocal trace
+            pick_loc, tr_loc = run_autostop_from_tensor(
+                coords_ca, self.structure_ctx, params,
+            )
+            trace = tr_loc
+            self._autostop_last_trace = tr_loc
+            self._autostop_last_coords_key = id(coords_ca)
+            return pick_loc, tr_loc
+
+        def _replay(monitor_params: dict, back_off: int):
+            assert trace is not None
+            return replay_monitor(
+                trace=trace,
+                monitor_params=monitor_params,
+                back_off=int(back_off),
+                device=device,
+                dtype=dtype,
+            )
+
+        try:
+            # ── L0: baseline ─────────────────────────────────────────
+            if 0 in enabled:
+                params0 = self._autostop_params()
+                pick0, tr0 = _run_md(params0)
+                result0 = self._autostop_downstream_from_pick(
+                    pick0, initial_coords_ca, zij_trunk,
+                    eigenvalues, eigenvectors, b_factors,
+                    step_idx, fallback_level=0, trace_stats=_trace_stats(tr0),
+                )
+                if _track(result0):
+                    return result0
+
+            # If L0 was skipped we still need a trace for replay-based levels.
+            if trace is None:
+                params_boot = self._autostop_params()
+                pick_boot, tr_boot = _run_md(params_boot)
+                _ = pick_boot
+
+            # ── L1: back_off adds (replay only) ──────────────────────
+            if 1 in enabled:
+                base_mon = self._autostop_params().monitor_only()
+                for add in cfg.autostop_fallback_back_off_adds:
+                    if add == 0:
+                        continue  # baseline = L0 already tried
+                    new_back = max(0, orig_back + int(add))
+                    pick = _replay(base_mon, new_back)
+                    res = self._autostop_downstream_from_pick(
+                        pick, initial_coords_ca, zij_trunk,
+                        eigenvalues, eigenvectors, b_factors,
+                        step_idx, fallback_level=1, trace_stats=_trace_stats(trace),
+                    )
+                    if _track(res):
+                        return res
+
+            # ── L2: v_magnitude scales (re-run MD) ───────────────────
+            if 2 in enabled:
+                for scale in cfg.autostop_fallback_v_scales:
+                    if scale == 1.0:
+                        continue
+                    cfg.autostop_v_magnitude = orig_v * float(scale)
+                    params = self._autostop_params()
+                    pick, tr = _run_md(params)
+                    res = self._autostop_downstream_from_pick(
+                        pick, initial_coords_ca, zij_trunk,
+                        eigenvalues, eigenvectors, b_factors,
+                        step_idx, fallback_level=2, trace_stats=_trace_stats(tr),
+                    )
+                    if _track(res):
+                        return res
+                cfg.autostop_v_magnitude = orig_v
+
+            # ── L3: eps_E/eps_N scales (replay only) ─────────────────
+            if 3 in enabled:
+                for se in cfg.autostop_fallback_eps_E_scales:
+                    for sn in cfg.autostop_fallback_eps_N_scales:
+                        if se == 1.0 and sn == 1.0:
+                            continue
+                        mon = dict(self._autostop_params().monitor_only())
+                        mon["eps_E_rel"] = max(1e-6, orig_eps_E * float(se))
+                        mon["eps_N_rel"] = max(1e-6, orig_eps_N * float(sn))
+                        pick = _replay(mon, orig_back)
+                        res = self._autostop_downstream_from_pick(
+                            pick, initial_coords_ca, zij_trunk,
+                            eigenvalues, eigenvectors, b_factors,
+                            step_idx, fallback_level=3, trace_stats=_trace_stats(trace),
+                        )
+                        if _track(res):
+                            return res
+
+            # ── L4: alpha scales (no MD, no monitor rerun — just re-blend) ──
+            # Reuse the BASELINE monitor pick, just change alpha.
+            if 4 in enabled:
+                base_mon = self._autostop_params().monitor_only()
+                for scale in cfg.autostop_fallback_alpha_scales:
+                    if scale == 1.0:
+                        continue
+                    cfg.z_mixing_alpha = orig_alpha * float(scale)
+                    pick = _replay(base_mon, orig_back)
+                    res = self._autostop_downstream_from_pick(
+                        pick, initial_coords_ca, zij_trunk,
+                        eigenvalues, eigenvectors, b_factors,
+                        step_idx, fallback_level=4, trace_stats=_trace_stats(trace),
+                    )
+                    if _track(res):
+                        return res
+                cfg.z_mixing_alpha = orig_alpha
+
+            # ── L5: patience deltas (replay only) ─────────────────────
+            if 5 in enabled:
+                for delta in cfg.autostop_fallback_patience_deltas:
+                    if delta == 0:
+                        continue
+                    mon = dict(self._autostop_params().monitor_only())
+                    mon["patience"] = max(1, orig_patience + int(delta))
+                    pick = _replay(mon, orig_back)
+                    res = self._autostop_downstream_from_pick(
+                        pick, initial_coords_ca, zij_trunk,
+                        eigenvalues, eigenvectors, b_factors,
+                        step_idx, fallback_level=5, trace_stats=_trace_stats(trace),
+                    )
+                    if _track(res):
+                        return res
+
+            # ── L6: smooth_w deltas (replay only) ─────────────────────
+            if 6 in enabled:
+                for delta in cfg.autostop_fallback_smooth_w_deltas:
+                    if delta == 0:
+                        continue
+                    mon = dict(self._autostop_params().monitor_only())
+                    mon["smooth_w"] = max(3, orig_smooth_w + int(delta))
+                    pick = _replay(mon, orig_back)
+                    res = self._autostop_downstream_from_pick(
+                        pick, initial_coords_ca, zij_trunk,
+                        eigenvalues, eigenvectors, b_factors,
+                        step_idx, fallback_level=6, trace_stats=_trace_stats(trace),
+                    )
+                    if _track(res):
+                        return res
+
+            # ── L7: grid (v × back_off × alpha) — RERUN MD per v ─────
+            if 7 in enabled:
+                cap = max(1, int(cfg.autostop_fallback_grid_cap))
+                tried = 0
+                for vs in cfg.autostop_fallback_v_scales:
+                    if tried >= cap:
+                        break
+                    cfg.autostop_v_magnitude = orig_v * float(vs)
+                    params = self._autostop_params()
+                    pick_base, tr_v = _run_md(params)  # refresh trace under new v
+                    for add in cfg.autostop_fallback_back_off_adds:
+                        if tried >= cap:
+                            break
+                        for a_scale in cfg.autostop_fallback_alpha_scales:
+                            if tried >= cap:
+                                break
+                            if vs == 1.0 and add == 0 and a_scale == 1.0:
+                                continue  # baseline
+                            cfg.z_mixing_alpha = orig_alpha * float(a_scale)
+                            new_back = max(0, orig_back + int(add))
+                            pick = _replay(params.monitor_only(), new_back)
+                            res = self._autostop_downstream_from_pick(
+                                pick, initial_coords_ca, zij_trunk,
+                                eigenvalues, eigenvectors, b_factors,
+                                step_idx, fallback_level=7, trace_stats=_trace_stats(tr_v),
+                            )
+                            tried += 1
+                            if _track(res):
+                                return res
+                cfg.autostop_v_magnitude = orig_v
+                cfg.z_mixing_alpha = orig_alpha
+
+            # ── L8: monitor-knob grid (replay only) ───────────────────
+            if 8 in enabled:
+                cap = max(1, int(cfg.autostop_fallback_grid_cap))
+                tried = 0
+                for se in cfg.autostop_fallback_eps_E_scales:
+                    if tried >= cap:
+                        break
+                    for sn in cfg.autostop_fallback_eps_N_scales:
+                        if tried >= cap:
+                            break
+                        for dp in cfg.autostop_fallback_patience_deltas:
+                            if tried >= cap:
+                                break
+                            for ds in cfg.autostop_fallback_smooth_w_deltas:
+                                if tried >= cap:
+                                    break
+                                if se == 1.0 and sn == 1.0 and dp == 0 and ds == 0:
+                                    continue
+                                mon = dict(self._autostop_params().monitor_only())
+                                mon["eps_E_rel"] = max(1e-6, orig_eps_E * float(se))
+                                mon["eps_N_rel"] = max(1e-6, orig_eps_N * float(sn))
+                                mon["patience"] = max(1, orig_patience + int(dp))
+                                mon["smooth_w"] = max(3, orig_smooth_w + int(ds))
+                                pick = _replay(mon, orig_back)
+                                res = self._autostop_downstream_from_pick(
+                                    pick, initial_coords_ca, zij_trunk,
+                                    eigenvalues, eigenvectors, b_factors,
+                                    step_idx, fallback_level=8, trace_stats=_trace_stats(trace),
+                                )
+                                tried += 1
+                                if _track(res):
+                                    return res
+
+            # ── L9: forced-accept best-so-far (or skip) ───────────────
+            if best_result is not None:
+                best_result.rejected = True
+                best_result.fallback_level = 9
+                if best_result.autostop_info is not None:
+                    best_result.autostop_info["fallback_level"] = 9
+                return best_result
+
+            # Hard fallback: run one baseline pick and return rejected.
+            params = self._autostop_params()
+            pick, tr = _run_md(params)
+            res = self._autostop_downstream_from_pick(
+                pick, initial_coords_ca, zij_trunk,
+                eigenvalues, eigenvectors, b_factors,
+                step_idx, fallback_level=9, trace_stats=_trace_stats(tr),
+            )
+            res.rejected = True
+            return res
+
+        finally:
+            # ALWAYS restore — even if a level returned successfully.
+            cfg.autostop_v_magnitude = orig_v
+            cfg.autostop_back_off = orig_back
+            cfg.autostop_eps_E_rel = orig_eps_E
+            cfg.autostop_eps_N_rel = orig_eps_N
+            cfg.autostop_patience = orig_patience
+            cfg.autostop_smooth_w = orig_smooth_w
+            cfg.autostop_warmup_frac = orig_warmup
+            cfg.autostop_crash_window_saves = orig_crash_win
+            cfg.autostop_crash_threshold = orig_crash_thr
             cfg.z_mixing_alpha = orig_alpha
 
     @torch.no_grad()
