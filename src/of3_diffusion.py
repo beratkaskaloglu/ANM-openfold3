@@ -262,12 +262,6 @@ def load_of3_diffusion(
                 outputs=output,
                 config=runner_config,
             )
-            print(f"[OF3] Confidence keys: {list(confidence.keys()) if isinstance(confidence, dict) else type(confidence)}")
-            for k, v in (confidence.items() if isinstance(confidence, dict) else []):
-                if hasattr(v, 'shape'):
-                    print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
-                else:
-                    print(f"  {k}: {type(v)} = {v}")
             return confidence
         except Exception as e:
             import traceback
@@ -310,11 +304,14 @@ def load_of3_diffusion(
             ca = all_ca[0].to(z_mod.device)
 
             if confidence is not None:
-                plddt_raw = confidence.get("pLDDT")
-                ptm_raw = confidence.get("pTM")
-                plddt = plddt_raw.squeeze() if plddt_raw is not None else None
+                plddt_raw = confidence.get("plddt")
+                ptm_raw = confidence.get("ptm")
+                # plddt: [1, 1, N_atom] atom-level → squeeze batch/sample dims
+                plddt = plddt_raw.squeeze(0).squeeze(0) if plddt_raw is not None else None
+                # ptm: [1, 1] scalar per sample → squeeze to scalar
                 ptm = ptm_raw.squeeze() if ptm_raw is not None else None
 
+                ptm_f = 0.0
                 ranking_val = 0.0
                 if ptm is not None:
                     ptm_f = ptm.item() if ptm.dim() == 0 else ptm.mean().item()
@@ -344,19 +341,21 @@ def load_of3_diffusion(
         confidence = _compute_confidence(atom_positions, zij_modified)
 
         if confidence is not None:
-            plddt_raw = confidence.get("pLDDT")  # [K, N] or similar
-            ptm_raw = confidence.get("pTM")       # [K] or similar
+            plddt_raw = confidence.get("plddt")  # [1, K, N_atom] atom-level
+            ptm_raw = confidence.get("ptm")      # [1, K] per-sample scalar
 
-            # Normalize shapes
+            # Normalize shapes — squeeze leading batch dim
             if plddt_raw is not None:
                 plddt = plddt_raw.squeeze(0) if plddt_raw.dim() > 2 else plddt_raw
+                # plddt now [K, N_atom] (atom-level)
                 if plddt.dim() == 1:
                     plddt = plddt.unsqueeze(0).expand(K, -1)
             else:
                 plddt = None
 
             if ptm_raw is not None:
-                ptm = ptm_raw.squeeze()
+                ptm = ptm_raw.squeeze(0) if ptm_raw.dim() > 1 else ptm_raw
+                # ptm now [K]
                 if ptm.dim() == 0:
                     ptm = ptm.unsqueeze(0).expand(K)
             else:
