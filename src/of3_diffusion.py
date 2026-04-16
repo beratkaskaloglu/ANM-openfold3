@@ -262,9 +262,17 @@ def load_of3_diffusion(
                 outputs=output,
                 config=runner_config,
             )
+            print(f"[OF3] Confidence keys: {list(confidence.keys()) if isinstance(confidence, dict) else type(confidence)}")
+            for k, v in (confidence.items() if isinstance(confidence, dict) else []):
+                if hasattr(v, 'shape'):
+                    print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
+                else:
+                    print(f"  {k}: {type(v)} = {v}")
             return confidence
         except Exception as e:
+            import traceback
             print(f"[OF3] Warning: confidence computation failed: {e}")
+            traceback.print_exc()
             return None
 
     @torch.no_grad()
@@ -322,8 +330,15 @@ def load_of3_diffusion(
                     ranking=torch.tensor([ranking_val]),
                 )
             else:
-                # No confidence available → return raw coords
-                return ca
+                # No confidence available → still return DiffusionResult for consistency
+                return DiffusionResult(
+                    all_ca=all_ca.to(z_mod.device),
+                    best_ca=ca,
+                    best_idx=0,
+                    plddt=None,
+                    ptm=None,
+                    ranking=None,
+                )
 
         # Multi-sample: compute confidence for ranking
         confidence = _compute_confidence(atom_positions, zij_modified)
