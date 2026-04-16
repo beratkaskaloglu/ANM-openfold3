@@ -85,6 +85,7 @@ class AutostopParams:
     n_steps: int = 5000
     save_every: int = 10
     back_off: int = 2
+    back_off_fraction: float | None = None  # if set, back_off = int(tk * fraction)
     crash_threshold_distance: float = 0.5
 
     # --- Monitor (early-stop) ---
@@ -534,7 +535,8 @@ def run_autostop_from_tensor(
     pick = _pick_from_monitor(monitor, trace, back_off=params.back_off,
                               monitor_params=params.monitor_only(),
                               stop_step_md=stop_step,
-                              device=device, dtype=dtype)
+                              device=device, dtype=dtype,
+                              back_off_fraction=params.back_off_fraction)
     return pick, trace
 
 
@@ -544,6 +546,7 @@ def replay_monitor(
     back_off: int,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
+    back_off_fraction: float | None = None,
 ) -> AutostopPick:
     """Cheap fallback path — re-run ONLY the monitor over the cached trace.
 
@@ -577,6 +580,7 @@ def replay_monitor(
         monitor_params=dict(monitor_params),
         stop_step_md=stop_step,
         device=device, dtype=dtype,
+        back_off_fraction=back_off_fraction,
     )
 
 
@@ -592,11 +596,16 @@ def _pick_from_monitor(
     stop_step_md: int | None,
     device: torch.device | str,
     dtype: torch.dtype,
+    back_off_fraction: float | None = None,
 ) -> AutostopPick:
     """Turn a monitor's argmin state into a concrete frame pick."""
     # Same arithmetic as run_autostop.run_with_autostop lines 310-320.
     k_turn = monitor.turnpoint_index() if monitor.argmin_E != 0 else 0
-    k_best = max(0, k_turn - max(0, int(back_off)))
+    if back_off_fraction is not None and k_turn > 0:
+        effective_back_off = int(k_turn * float(back_off_fraction))
+    else:
+        effective_back_off = max(0, int(back_off))
+    k_best = max(0, k_turn - effective_back_off)
     # trajectory[0] = initial, trajectory[i+1] == save i
     traj_idx = min(k_best + 1, len(trace.trajectory) - 1)
     picked_np = trace.trajectory[traj_idx]
@@ -617,7 +626,7 @@ def _pick_from_monitor(
         argmin_N_k=int(monitor.argmin_N),
         stop_step_md=stop_step_md,
         crashes_total=crashes_total,
-        back_off_used=int(back_off),
+        back_off_used=int(effective_back_off),
         monitor_params=dict(monitor_params),
         stop_reason=monitor.stop_reason,
     )

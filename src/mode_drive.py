@@ -128,6 +128,7 @@ class ModeDriveConfig:
     autostop_n_steps: int = 5000
     autostop_save_every: int = 10
     autostop_back_off: int = 2
+    autostop_back_off_fraction: float | None = None  # if set, back_off = int(tk * fraction); overrides fixed back_off
     autostop_crash_threshold_distance: float = 0.5
     # Monitor (early-stop)
     autostop_smooth_w: int = 11
@@ -661,6 +662,7 @@ class ModeDrivePipeline:
             n_steps=cfg.autostop_n_steps,
             save_every=cfg.autostop_save_every,
             back_off=cfg.autostop_back_off,
+            back_off_fraction=cfg.autostop_back_off_fraction,
             crash_threshold_distance=cfg.autostop_crash_threshold_distance,
             smooth_w=max(3, cfg.autostop_smooth_w),
             warmup_frac=max(0.0, min(0.5, cfg.autostop_warmup_frac)),
@@ -1249,6 +1251,7 @@ class ModeDrivePipeline:
                 back_off=int(back_off),
                 device=device,
                 dtype=dtype,
+                back_off_fraction=cfg.autostop_back_off_fraction,
             )
 
         try:
