@@ -124,6 +124,7 @@ class StepResult:
     eigenvectors: torch.Tensor       # [N, n_modes, 3]
     b_factors: torch.Tensor          # [N]
     df_used: float = 0.0             # actual df applied
+    alpha_used: float = 0.0          # actual z_mixing_alpha applied
 
     # Confidence metrics (populated when multi-sample diffusion is used)
     plddt: torch.Tensor | None = None         # [N] best sample per-residue pLDDT
@@ -533,6 +534,7 @@ class ModeDrivePipeline:
             eigenvectors=eigenvectors,
             b_factors=b_factors,
             df_used=df_used,
+            alpha_used=cfg.z_mixing_alpha,
             plddt=plddt_out,
             ptm=ptm_out,
             ranking_score=ranking_out,
@@ -867,7 +869,7 @@ class ModeDrivePipeline:
         if verbose:
             N = initial_coords_ca.shape[0]
             has_target = target_coords is not None
-            header = f"{'Step':>6} {'RMSD_init':>10} {'df':>6} {'Combo':>20}"
+            header = f"{'Step':>6} {'RMSD_init':>10} {'df':>6} {'α':>5} {'Combo':>20}"
             if has_target:
                 header += f" {'RMSD_tgt':>10} {'TM_tgt':>8}"
             header += f" {'pTM':>6} {'pLDDT':>6} {'FB':>3}"
@@ -883,7 +885,7 @@ class ModeDrivePipeline:
             print(f"{'-'*len(header)}")
 
             # Initial state
-            init_line = f"{'Init':>6} {'0.000':>10} {'—':>6} {'—':>20}"
+            init_line = f"{'Init':>6} {'0.000':>10} {'—':>6} {'—':>5} {'—':>20}"
             if has_target:
                 rmsd_tgt = compute_rmsd(initial_coords_ca, target_coords)
                 tm_tgt = tm_score(initial_coords_ca, target_coords)
@@ -924,6 +926,7 @@ class ModeDrivePipeline:
                     f"{step_idx+1:>6} "
                     f"{step_result.rmsd:>10.3f} "
                     f"{step_result.df_used:>6.2f} "
+                    f"{step_result.alpha_used:>5.2f} "
                     f"{combo_label:>20}"
                 )
                 if has_target:
