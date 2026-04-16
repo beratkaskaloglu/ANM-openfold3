@@ -39,8 +39,11 @@ from .mode_combinator import (
 # DiffusionResult is checked via isinstance at runtime
 try:
     from .of3_diffusion import DiffusionResult
-except ImportError:
-    DiffusionResult = None  # type: ignore[assignment,misc]
+except (ImportError, Exception):
+    try:
+        from src.of3_diffusion import DiffusionResult  # type: ignore[no-redef]
+    except (ImportError, Exception):
+        DiffusionResult = None  # type: ignore[assignment,misc]
 
 
 @dataclass
@@ -494,7 +497,7 @@ class ModeDrivePipeline:
 
         if self.diffusion_fn is not None:
             diff_result = self.diffusion_fn(z_mod)
-            if DiffusionResult is not None and isinstance(diff_result, DiffusionResult):
+            if hasattr(diff_result, "best_ca"):
                 new_ca = diff_result.best_ca
                 num_samples_out = diff_result.all_ca.shape[0]
                 if diff_result.plddt is not None:
