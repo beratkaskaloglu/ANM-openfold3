@@ -102,7 +102,6 @@ class ModeDriveConfig:
     fallback_df_factor: float = 0.5              # Level 2: df *= this
     fallback_max_combo_size: int = 1             # Level 3: reduce to single mode
     fallback_alpha_factor: float = 0.5           # Level 4: alpha *= this
-    max_fallback_retries: int = 4                # max retry levels per step
     # Level 5: extended (combo × df × alpha) grid search
     fallback_extended_enabled: bool = True       # enable aggressive grid search when L0-L4 fail
     fallback_extended_combo_count: int = 10      # top N combos to iterate
