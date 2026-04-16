@@ -154,8 +154,12 @@ class ModeDriveConfig:
     autostop_fallback_crash_window_scales: tuple[float, ...] = (1.0, 2.0, 0.5)
     autostop_fallback_crash_threshold_adds: tuple[int, ...] = (0, 2, -2)
     autostop_fallback_alpha_scales: tuple[float, ...] = (1.0, 0.5, 0.25)  # L4/L7 z_mixing_alpha multipliers
-    # Which L0-L9 levels to enable (default: all).
-    autostop_fallback_levels: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
+    # Which L0-L9 levels to enable (default: L0 + cheap replay-only levels
+    # L1 back_off and L4 alpha; L9 is forced-accept safety net).
+    # L2/L7 re-run MD (expensive), so they are disabled by default.
+    # L3/L5/L6/L8 are replay-only but user's baseline strategy is
+    # "go back in picked + change alpha" only, so they are off as well.
+    autostop_fallback_levels: tuple[int, ...] = (0, 1, 4, 9)
     # Max cells per extended grid (L7, L8) — prevents combinatorial blow-up.
     autostop_fallback_grid_cap: int = 8
 
@@ -1166,13 +1170,47 @@ class ModeDrivePipeline:
         best_result: StepResult | None = None
         best_ranking = -1.0
 
-        def _track(result: StepResult) -> bool:
+        def _track(
+            result: StepResult,
+            *,
+            level: int = 0,
+            desc: str = "",
+        ) -> bool:
             nonlocal best_result, best_ranking
             r_score = result.ranking_score if result.ranking_score is not None else 0.0
             if r_score > best_ranking:
                 best_ranking = r_score
                 best_result = result
-            return self._confidence_ok(result)
+            ok = self._confidence_ok(result)
+            if cfg.autostop_verbose:
+                # pTM
+                ptm_str = (
+                    f"{result.ptm:.3f}" if result.ptm is not None else "  -  "
+                )
+                # mean pLDDT (0-100)
+                if result.plddt is not None:
+                    try:
+                        plddt_mean = float(result.plddt.mean().item())
+                    except Exception:
+                        plddt_mean = float("nan")
+                    plddt_str = f"{plddt_mean:5.1f}"
+                else:
+                    plddt_str = "  -  "
+                rank_str = (
+                    f"{result.ranking_score:.3f}"
+                    if result.ranking_score is not None else "  -  "
+                )
+                ai = result.autostop_info or {}
+                pk = ai.get("picked_step_md", "-")
+                tk = ai.get("turn_k", "-")
+                tag = "PASS" if ok else "FAIL"
+                print(
+                    f"      [FB L{level}] {tag}  {desc:<24s}  "
+                    f"pk={pk!s:>5} tk={tk!s:>3}  "
+                    f"pTM={ptm_str}  pLDDT={plddt_str}  rank={rank_str}  "
+                    f"RMSD_init={result.rmsd:.2f}Å"
+                )
+            return ok
 
         # Compute ANM modes once for diagnostics — same cost as _autostop_step
         H = build_hessian(coords_ca, cfg.anm_cutoff, cfg.anm_gamma, cfg.anm_tau)
@@ -1223,7 +1261,10 @@ class ModeDrivePipeline:
                     eigenvalues, eigenvectors, b_factors,
                     step_idx, fallback_level=0, trace_stats=_trace_stats(tr0),
                 )
-                if _track(result0):
+                if _track(
+                    result0, level=0,
+                    desc=f"baseline v={orig_v:.2f} α={orig_alpha:.2f} back={orig_back}",
+                ):
                     return result0
 
             # If L0 was skipped we still need a trace for replay-based levels.
@@ -1245,7 +1286,10 @@ class ModeDrivePipeline:
                         eigenvalues, eigenvectors, b_factors,
                         step_idx, fallback_level=1, trace_stats=_trace_stats(trace),
                     )
-                    if _track(res):
+                    if _track(
+                        res, level=1,
+                        desc=f"back_off {orig_back}→{new_back} (add={add:+d})",
+                    ):
                         return res
 
             # ── L2: v_magnitude scales (re-run MD) ───────────────────
@@ -1261,7 +1305,10 @@ class ModeDrivePipeline:
                         eigenvalues, eigenvectors, b_factors,
                         step_idx, fallback_level=2, trace_stats=_trace_stats(tr),
                     )
-                    if _track(res):
+                    if _track(
+                        res, level=2,
+                        desc=f"v_mag×{scale:.2f}→{cfg.autostop_v_magnitude:.2f} (RERUN MD)",
+                    ):
                         return res
                 cfg.autostop_v_magnitude = orig_v
 
@@ -1280,7 +1327,10 @@ class ModeDrivePipeline:
                             eigenvalues, eigenvectors, b_factors,
                             step_idx, fallback_level=3, trace_stats=_trace_stats(trace),
                         )
-                        if _track(res):
+                        if _track(
+                            res, level=3,
+                            desc=f"eps_E×{se:.1f} eps_N×{sn:.1f}",
+                        ):
                             return res
 
             # ── L4: alpha scales (no MD, no monitor rerun — just re-blend) ──
@@ -1297,7 +1347,10 @@ class ModeDrivePipeline:
                         eigenvalues, eigenvectors, b_factors,
                         step_idx, fallback_level=4, trace_stats=_trace_stats(trace),
                     )
-                    if _track(res):
+                    if _track(
+                        res, level=4,
+                        desc=f"α×{scale:.2f}→{cfg.z_mixing_alpha:.2f}",
+                    ):
                         return res
                 cfg.z_mixing_alpha = orig_alpha
 
@@ -1307,14 +1360,18 @@ class ModeDrivePipeline:
                     if delta == 0:
                         continue
                     mon = dict(self._autostop_params().monitor_only())
-                    mon["patience"] = max(1, orig_patience + int(delta))
+                    new_pat = max(1, orig_patience + int(delta))
+                    mon["patience"] = new_pat
                     pick = _replay(mon, orig_back)
                     res = self._autostop_downstream_from_pick(
                         pick, initial_coords_ca, zij_trunk,
                         eigenvalues, eigenvectors, b_factors,
                         step_idx, fallback_level=5, trace_stats=_trace_stats(trace),
                     )
-                    if _track(res):
+                    if _track(
+                        res, level=5,
+                        desc=f"patience {orig_patience}→{new_pat} (Δ={delta:+d})",
+                    ):
                         return res
 
             # ── L6: smooth_w deltas (replay only) ─────────────────────
@@ -1323,14 +1380,18 @@ class ModeDrivePipeline:
                     if delta == 0:
                         continue
                     mon = dict(self._autostop_params().monitor_only())
-                    mon["smooth_w"] = max(3, orig_smooth_w + int(delta))
+                    new_sw = max(3, orig_smooth_w + int(delta))
+                    mon["smooth_w"] = new_sw
                     pick = _replay(mon, orig_back)
                     res = self._autostop_downstream_from_pick(
                         pick, initial_coords_ca, zij_trunk,
                         eigenvalues, eigenvectors, b_factors,
                         step_idx, fallback_level=6, trace_stats=_trace_stats(trace),
                     )
-                    if _track(res):
+                    if _track(
+                        res, level=6,
+                        desc=f"smooth_w {orig_smooth_w}→{new_sw} (Δ={delta:+d})",
+                    ):
                         return res
 
             # ── L7: grid (v × back_off × alpha) — RERUN MD per v ─────
@@ -1360,7 +1421,13 @@ class ModeDrivePipeline:
                                 step_idx, fallback_level=7, trace_stats=_trace_stats(tr_v),
                             )
                             tried += 1
-                            if _track(res):
+                            if _track(
+                                res, level=7,
+                                desc=(
+                                    f"grid v×{vs:.2f} back+{add} α×{a_scale:.2f} "
+                                    f"(RERUN MD)"
+                                ),
+                            ):
                                 return res
                 cfg.autostop_v_magnitude = orig_v
                 cfg.z_mixing_alpha = orig_alpha
@@ -1395,7 +1462,13 @@ class ModeDrivePipeline:
                                     step_idx, fallback_level=8, trace_stats=_trace_stats(trace),
                                 )
                                 tried += 1
-                                if _track(res):
+                                if _track(
+                                    res, level=8,
+                                    desc=(
+                                        f"grid eps_E×{se:.1f} eps_N×{sn:.1f} "
+                                        f"pat{dp:+d} sw{ds:+d}"
+                                    ),
+                                ):
                                     return res
 
             # ── L9: forced-accept best-so-far (or skip) ───────────────
@@ -1404,6 +1477,12 @@ class ModeDrivePipeline:
                 best_result.fallback_level = 9
                 if best_result.autostop_info is not None:
                     best_result.autostop_info["fallback_level"] = 9
+                if cfg.autostop_verbose:
+                    print(
+                        f"      [FB L9] FORCE  all attempts failed confidence → "
+                        f"accepting best-so-far (rank={best_ranking:.3f}, "
+                        f"RMSD_init={best_result.rmsd:.2f}Å)"
+                    )
                 return best_result
 
             # Hard fallback: run one baseline pick and return rejected.
@@ -1415,6 +1494,11 @@ class ModeDrivePipeline:
                 step_idx, fallback_level=9, trace_stats=_trace_stats(tr),
             )
             res.rejected = True
+            if cfg.autostop_verbose:
+                print(
+                    f"      [FB L9] FORCE  no prior attempts tracked → "
+                    f"hard baseline accepted (rejected=True)"
+                )
             return res
 
         finally:
