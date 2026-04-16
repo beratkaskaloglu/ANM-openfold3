@@ -702,82 +702,77 @@ class ModeDrivePipeline:
                 best_result = result
             return self._confidence_ok(result)
 
-        # ── Level 0: Normal step (best combo) ──
-        result = self.step(
-            coords_ca, initial_coords_ca, zij_trunk,
-            prev_rmsd, target_coords,
-        )
-        result.fallback_level = 0
-        if _track(result):
-            return result
-
-        # ── Level 1: Try next combos by collectivity ──
-        # Re-compute ANM modes and generate full combo list
-        H = build_hessian(coords_ca, cfg.anm_cutoff, cfg.anm_gamma, cfg.anm_tau)
-        eigenvalues, eigenvectors = anm_modes(H, cfg.n_anm_modes)
-        b_factors = anm_bfactors(eigenvalues, eigenvectors)
-        n_modes = eigenvalues.shape[0]
-
-        combos = self._generate_combos(
-            n_modes, coords_ca, eigenvectors, eigenvalues,
-            cfg.df, target_coords,
-        )
-
-        # The first combo was already tried in step(). Try the next ones.
-        n_combo_tries = min(cfg.fallback_combo_tries, len(combos) - 1)
-        for ci in range(1, 1 + n_combo_tries):
-            combo_result = self._evaluate_combo(
-                combos[ci], coords_ca, initial_coords_ca, eigenvectors,
-                zij_trunk, eigenvalues, b_factors, cfg.df,
+        try:
+            # ── Level 0: Normal step (best combo) ──
+            result = self.step(
+                coords_ca, initial_coords_ca, zij_trunk,
+                prev_rmsd, target_coords,
             )
-            combo_result.fallback_level = 1
-            if _track(combo_result):
-                return combo_result
+            result.fallback_level = 0
+            if _track(result):
+                return result
 
-        # ── Level 2: Reduce df ──
-        cfg.df = orig_df * cfg.fallback_df_factor
-        cfg.df_min = orig_df_min * cfg.fallback_df_factor
-        result = self.step(
-            coords_ca, initial_coords_ca, zij_trunk,
-            prev_rmsd, target_coords,
-        )
-        result.fallback_level = 2
-        if _track(result):
-            cfg.df = orig_df
-            cfg.df_min = orig_df_min
-            return result
+            # ── Level 1: Try next combos by collectivity ──
+            H = build_hessian(coords_ca, cfg.anm_cutoff, cfg.anm_gamma, cfg.anm_tau)
+            eigenvalues, eigenvectors = anm_modes(H, cfg.n_anm_modes)
+            b_factors = anm_bfactors(eigenvalues, eigenvectors)
+            n_modes = eigenvalues.shape[0]
 
-        # ── Level 3: Single mode (+ keep reduced df) ──
-        cfg.max_combo_size = cfg.fallback_max_combo_size
-        result = self.step(
-            coords_ca, initial_coords_ca, zij_trunk,
-            prev_rmsd, target_coords,
-        )
-        result.fallback_level = 3
-        if _track(result):
+            combos = self._generate_combos(
+                n_modes, coords_ca, eigenvectors, eigenvalues,
+                cfg.df, target_coords,
+            )
+
+            n_combo_tries = min(cfg.fallback_combo_tries, len(combos) - 1)
+            for ci in range(1, 1 + n_combo_tries):
+                combo_result = self._evaluate_combo(
+                    combos[ci], coords_ca, initial_coords_ca, eigenvectors,
+                    zij_trunk, eigenvalues, b_factors, cfg.df,
+                )
+                combo_result.fallback_level = 1
+                if _track(combo_result):
+                    return combo_result
+
+            # ── Level 2: Reduce df ──
+            cfg.df = orig_df * cfg.fallback_df_factor
+            cfg.df_min = orig_df_min * cfg.fallback_df_factor
+            result = self.step(
+                coords_ca, initial_coords_ca, zij_trunk,
+                prev_rmsd, target_coords,
+            )
+            result.fallback_level = 2
+            if _track(result):
+                return result
+
+            # ── Level 3: Single mode (+ keep reduced df) ──
+            cfg.max_combo_size = cfg.fallback_max_combo_size
+            result = self.step(
+                coords_ca, initial_coords_ca, zij_trunk,
+                prev_rmsd, target_coords,
+            )
+            result.fallback_level = 3
+            if _track(result):
+                return result
+
+            # ── Level 4: Reduce alpha (+ keep reduced df + single mode) ──
+            cfg.z_mixing_alpha = orig_alpha * cfg.fallback_alpha_factor
+            result = self.step(
+                coords_ca, initial_coords_ca, zij_trunk,
+                prev_rmsd, target_coords,
+            )
+            result.fallback_level = 4
+            _track(result)
+
+            # Forced accept: best attempt across all levels
+            assert best_result is not None
+            return best_result
+
+        finally:
+            # ALWAYS restore config — no matter which level returned
             cfg.df = orig_df
             cfg.df_min = orig_df_min
             cfg.max_combo_size = orig_max_combo
-            return result
-
-        # ── Level 4: Reduce alpha (+ keep reduced df + single mode) ──
-        cfg.z_mixing_alpha = orig_alpha * cfg.fallback_alpha_factor
-        result = self.step(
-            coords_ca, initial_coords_ca, zij_trunk,
-            prev_rmsd, target_coords,
-        )
-        result.fallback_level = 4
-        _track(result)
-
-        # Restore config
-        cfg.df = orig_df
-        cfg.df_min = orig_df_min
-        cfg.max_combo_size = orig_max_combo
-        cfg.z_mixing_alpha = orig_alpha
-
-        # Forced accept: best attempt across all levels
-        assert best_result is not None
-        return best_result
+            cfg.z_mixing_alpha = orig_alpha
 
     @torch.no_grad()
     def run(
