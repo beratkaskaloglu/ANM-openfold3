@@ -182,13 +182,15 @@ Her step sonrası confidence check:
 ```
 Confidence OK (ranking_score >= cutoff)?
   ├── EVET → kabul et, sonraki step'e geç
-  └── HAYIR → Fallback Level 1: df'yi düşür
+  └── HAYIR → Fallback Level 1: sonraki N combo'yu dene (collectivity sırasıyla)
         ├── Confidence OK? → kabul et
-        └── HAYIR → Fallback Level 2: mode subset'i küçült
+        └── HAYIR → Fallback Level 2: df'yi düşür
               ├── Confidence OK? → kabul et
-              └── HAYIR → Fallback Level 3: z_mixing alpha'yı düşür
+              └── HAYIR → Fallback Level 3: mode subset'i küçült (tek mod)
                     ├── Confidence OK? → kabul et
-                    └── HAYIR → en iyi denemeyi kabul et (forced accept)
+                    └── HAYIR → Fallback Level 4: z_mixing alpha'yı düşür
+                          ├── Confidence OK? → kabul et
+                          └── HAYIR → en iyi denemeyi kabul et (forced accept)
 ```
 
 ### 5.2 Fallback Parametreleri
@@ -206,10 +208,11 @@ num_diffusion_samples: int = 5           # K: samples per step
 
 # Fallback parameters
 enable_confidence_fallback: bool = True
-fallback_df_factor: float = 0.5          # df *= 0.5 at level 1
-fallback_max_combo_size: int = 1         # reduce to single mode at level 2
-fallback_alpha_factor: float = 0.5       # alpha *= 0.5 at level 3
-max_fallback_retries: int = 3            # max retries per step
+fallback_combo_tries: int = 3            # Level 1: try next N combos
+fallback_df_factor: float = 0.5          # df *= 0.5 at level 2
+fallback_max_combo_size: int = 1         # reduce to single mode at level 3
+fallback_alpha_factor: float = 0.5       # alpha *= 0.5 at level 4
+max_fallback_retries: int = 4            # max retries per step
 ```
 
 ### 5.3 Fallback Algoritması
@@ -262,9 +265,10 @@ def _step_with_fallback(self, step_idx, coords, zij_trunk, ...):
 | Level | Aksiyon | Neden | Etki |
 |-------|---------|-------|------|
 | 0 | Normal çalış | - | Tam deplasman |
-| 1 | df *= 0.5 | Çok büyük deplasman → clash | Daha küçük hareket |
-| 2 | max_combo_size = 1 | Çok fazla mod karışımı → gürültü | Tek mod, temiz hareket |
-| 3 | alpha *= 0.5 | z_pseudo çok dominant → trunk'tan uzak | Trunk'a yakın kal |
+| 1 | Sonraki N combo dene | Bu combo kötü, başka collectivity combo'su daha iyi olabilir | Farklı mod kombinasyonu |
+| 2 | df *= 0.5 | Çok büyük deplasman → clash | Daha küçük hareket |
+| 3 | max_combo_size = 1 | Çok fazla mod karışımı → gürültü | Tek mod, temiz hareket |
+| 4 | alpha *= 0.5 | z_pseudo çok dominant → trunk'tan uzak | Trunk'a yakın kal |
 | forced | En iyi denemeyi al | Hiçbiri geçemedi | Minimum hasar |
 
 ## 6. StepResult Güncellemesi

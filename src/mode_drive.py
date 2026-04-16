@@ -95,10 +95,11 @@ class ModeDriveConfig:
 
     # Adaptive fallback
     enable_confidence_fallback: bool = False      # enable confidence-guided fallback
-    fallback_df_factor: float = 0.5              # Level 1: df *= this
-    fallback_max_combo_size: int = 1             # Level 2: reduce to single mode
-    fallback_alpha_factor: float = 0.5           # Level 3: alpha *= this
-    max_fallback_retries: int = 3                # max retry levels per step
+    fallback_combo_tries: int = 3                # Level 1: try next N combos by collectivity
+    fallback_df_factor: float = 0.5              # Level 2: df *= this
+    fallback_max_combo_size: int = 1             # Level 3: reduce to single mode
+    fallback_alpha_factor: float = 0.5           # Level 4: alpha *= this
+    max_fallback_retries: int = 4                # max retry levels per step
 
 
 @dataclass
@@ -673,10 +674,11 @@ class ModeDrivePipeline:
         """Run step with confidence-guided adaptive fallback.
 
         Fallback levels:
-            0: Normal step (original params)
-            1: Reduce df by fallback_df_factor
-            2: Reduce max_combo_size to fallback_max_combo_size (single mode)
-            3: Reduce z_mixing_alpha by fallback_alpha_factor
+            0: Normal step (best combo by RMSD/collectivity)
+            1: Try next N combos with higher collectivity (combo fallback)
+            2: Reduce df by fallback_df_factor
+            3: Reduce max_combo_size to single mode
+            4: Reduce z_mixing_alpha by fallback_alpha_factor
 
         If all levels fail, returns the attempt with highest ranking score.
         """
@@ -691,37 +693,81 @@ class ModeDrivePipeline:
         best_result: StepResult | None = None
         best_ranking = -1.0
 
-        for level in range(cfg.max_fallback_retries + 1):
-            if level == 1:
-                # Fallback L1: reduce df
-                cfg.df = orig_df * cfg.fallback_df_factor
-                cfg.df_min = orig_df_min * cfg.fallback_df_factor
-            elif level == 2:
-                # Fallback L2: single mode (+ keep reduced df)
-                cfg.max_combo_size = cfg.fallback_max_combo_size
-            elif level == 3:
-                # Fallback L3: reduce alpha (+ keep reduced df + single mode)
-                cfg.z_mixing_alpha = orig_alpha * cfg.fallback_alpha_factor
-
-            result = self.step(
-                coords_ca, initial_coords_ca, zij_trunk,
-                prev_rmsd, target_coords,
-            )
-            result.fallback_level = level
-
-            # Track best attempt by ranking
+        def _track(result: StepResult) -> bool:
+            """Track best result, return True if confidence OK."""
+            nonlocal best_result, best_ranking
             r_score = result.ranking_score if result.ranking_score is not None else 0.0
             if r_score > best_ranking:
                 best_ranking = r_score
                 best_result = result
+            return self._confidence_ok(result)
 
-            if self._confidence_ok(result):
-                # Restore config and return
-                cfg.df = orig_df
-                cfg.df_min = orig_df_min
-                cfg.max_combo_size = orig_max_combo
-                cfg.z_mixing_alpha = orig_alpha
-                return result
+        # ── Level 0: Normal step (best combo) ──
+        result = self.step(
+            coords_ca, initial_coords_ca, zij_trunk,
+            prev_rmsd, target_coords,
+        )
+        result.fallback_level = 0
+        if _track(result):
+            return result
+
+        # ── Level 1: Try next combos by collectivity ──
+        # Re-compute ANM modes and generate full combo list
+        H = build_hessian(coords_ca, cfg.anm_cutoff, cfg.anm_gamma, cfg.anm_tau)
+        eigenvalues, eigenvectors = anm_modes(H, cfg.n_anm_modes)
+        b_factors = anm_bfactors(eigenvalues, eigenvectors)
+        n_modes = eigenvalues.shape[0]
+
+        combos = self._generate_combos(
+            n_modes, coords_ca, eigenvectors, eigenvalues,
+            cfg.df, target_coords,
+        )
+
+        # The first combo was already tried in step(). Try the next ones.
+        n_combo_tries = min(cfg.fallback_combo_tries, len(combos) - 1)
+        for ci in range(1, 1 + n_combo_tries):
+            combo_result = self._evaluate_combo(
+                combos[ci], coords_ca, initial_coords_ca, eigenvectors,
+                zij_trunk, eigenvalues, b_factors, cfg.df,
+            )
+            combo_result.fallback_level = 1
+            if _track(combo_result):
+                return combo_result
+
+        # ── Level 2: Reduce df ──
+        cfg.df = orig_df * cfg.fallback_df_factor
+        cfg.df_min = orig_df_min * cfg.fallback_df_factor
+        result = self.step(
+            coords_ca, initial_coords_ca, zij_trunk,
+            prev_rmsd, target_coords,
+        )
+        result.fallback_level = 2
+        if _track(result):
+            cfg.df = orig_df
+            cfg.df_min = orig_df_min
+            return result
+
+        # ── Level 3: Single mode (+ keep reduced df) ──
+        cfg.max_combo_size = cfg.fallback_max_combo_size
+        result = self.step(
+            coords_ca, initial_coords_ca, zij_trunk,
+            prev_rmsd, target_coords,
+        )
+        result.fallback_level = 3
+        if _track(result):
+            cfg.df = orig_df
+            cfg.df_min = orig_df_min
+            cfg.max_combo_size = orig_max_combo
+            return result
+
+        # ── Level 4: Reduce alpha (+ keep reduced df + single mode) ──
+        cfg.z_mixing_alpha = orig_alpha * cfg.fallback_alpha_factor
+        result = self.step(
+            coords_ca, initial_coords_ca, zij_trunk,
+            prev_rmsd, target_coords,
+        )
+        result.fallback_level = 4
+        _track(result)
 
         # Restore config
         cfg.df = orig_df
@@ -729,7 +775,7 @@ class ModeDrivePipeline:
         cfg.max_combo_size = orig_max_combo
         cfg.z_mixing_alpha = orig_alpha
 
-        # Forced accept: best attempt
+        # Forced accept: best attempt across all levels
         assert best_result is not None
         return best_result
 
