@@ -92,8 +92,8 @@ class ModeDriveConfig:
 
     # Confidence & multi-sample
     num_diffusion_samples: int = 1               # K: samples per diffusion call
-    confidence_ptm_cutoff: float = 0.5           # minimum pTM to accept step
-    confidence_plddt_cutoff: float = 0.6         # minimum mean pLDDT to accept
+    confidence_ptm_cutoff: float = 0.5           # minimum pTM to accept step (0-1)
+    confidence_plddt_cutoff: float = 70.0        # minimum mean pLDDT to accept (0-100 scale, OF3 native)
     confidence_ranking_cutoff: float = 0.5       # minimum ranking score to accept
 
     # Adaptive fallback
@@ -658,11 +658,35 @@ class ModeDrivePipeline:
         return best_overall
 
     def _confidence_ok(self, result: StepResult) -> bool:
-        """Check if step result passes confidence cutoffs."""
+        """Check if step result passes ALL confidence cutoffs (AND logic).
+
+        Gates: pTM, mean pLDDT (0-100 scale), ranking_score.
+        If no confidence data is available, passes by default.
+        """
         cfg = self.config
-        if result.ranking_score is not None:
-            return result.ranking_score >= cfg.confidence_ranking_cutoff
-        # No confidence data → pass by default
+
+        # No confidence data at all → pass (K=1 without confidence, or disabled)
+        if (
+            result.ptm is None
+            and result.plddt is None
+            and result.ranking_score is None
+        ):
+            return True
+
+        # pTM gate
+        if result.ptm is not None and result.ptm < cfg.confidence_ptm_cutoff:
+            return False
+        # pLDDT gate (OF3 returns 0-100 scale; cutoff must match that scale)
+        if result.plddt is not None:
+            mean_plddt = result.plddt.mean().item()
+            if mean_plddt < cfg.confidence_plddt_cutoff:
+                return False
+        # Ranking gate
+        if (
+            result.ranking_score is not None
+            and result.ranking_score < cfg.confidence_ranking_cutoff
+        ):
+            return False
         return True
 
     @torch.no_grad()
