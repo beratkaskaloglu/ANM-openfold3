@@ -103,6 +103,11 @@ class ModeDriveConfig:
     fallback_max_combo_size: int = 1             # Level 3: reduce to single mode
     fallback_alpha_factor: float = 0.5           # Level 4: alpha *= this
     max_fallback_retries: int = 4                # max retry levels per step
+    # Level 5: extended (combo × df × alpha) grid search
+    fallback_extended_enabled: bool = True       # enable aggressive grid search when L0-L4 fail
+    fallback_extended_combo_count: int = 10      # top N combos to iterate
+    fallback_extended_df_scales: tuple[float, ...] = (0.5, 0.25)   # df multipliers
+    fallback_extended_alpha_scales: tuple[float, ...] = (0.5, 0.25)  # alpha multipliers
 
 
 @dataclass
@@ -127,6 +132,7 @@ class StepResult:
     all_ptm: torch.Tensor | None = None       # [K] all samples' pTM
     all_ranking: torch.Tensor | None = None   # [K] all samples' ranking
     fallback_level: int = 0                   # 0=normal, 1=df, 2=modes, 3=alpha
+    rejected: bool = False                    # True if all fallback levels failed (forced-accept)
     num_samples: int = 1                      # K diffusion samples used
 
 
@@ -788,10 +794,34 @@ class ModeDrivePipeline:
                 prev_rmsd, target_coords,
             )
             result.fallback_level = 4
-            _track(result)
+            if _track(result):
+                return result
 
-            # Forced accept: best attempt across all levels
+            # ── Level 5: Extended grid search (combo × df × alpha) ──
+            # Aggressive exploration: iterate over top-N combos with multiple
+            # df and alpha scales. First attempt that passes cutoffs wins.
+            if cfg.fallback_extended_enabled:
+                cfg.max_combo_size = cfg.fallback_max_combo_size  # single-mode combos
+                n_ext = min(cfg.fallback_extended_combo_count, len(combos))
+                for ci in range(n_ext):
+                    for df_scale in cfg.fallback_extended_df_scales:
+                        cfg.df = orig_df * df_scale
+                        cfg.df_min = orig_df_min * df_scale
+                        for alpha_scale in cfg.fallback_extended_alpha_scales:
+                            cfg.z_mixing_alpha = orig_alpha * alpha_scale
+                            ext_result = self._evaluate_combo(
+                                combos[ci], coords_ca, initial_coords_ca,
+                                eigenvectors, zij_trunk, eigenvalues,
+                                b_factors, cfg.df,
+                            )
+                            ext_result.fallback_level = 5
+                            if _track(ext_result):
+                                return ext_result
+
+            # Forced accept: best attempt across all levels.
+            # Mark as rejected so the caller can keep previous base coords.
             assert best_result is not None
+            best_result.rejected = True
             return best_result
 
         finally:
@@ -883,7 +913,12 @@ class ModeDrivePipeline:
                     f"{step_result.plddt.mean().item():.3f}"
                     if step_result.plddt is not None else "—"
                 )
-                fb_str = str(step_result.fallback_level) if step_result.fallback_level > 0 else "—"
+                if step_result.rejected:
+                    fb_str = f"!{step_result.fallback_level}"
+                elif step_result.fallback_level > 0:
+                    fb_str = str(step_result.fallback_level)
+                else:
+                    fb_str = "—"
 
                 line = (
                     f"{step_idx+1:>6} "
@@ -898,10 +933,14 @@ class ModeDrivePipeline:
                 line += f" {ptm_str:>6} {plddt_str:>6} {fb_str:>3}"
                 print(line)
 
-            # Update for next step
-            prev_rmsd = step_result.rmsd
-            coords_ca = step_result.new_ca
-            z_current = step_result.z_modified
+            # Update for next step only if not rejected.
+            # Rejected steps are logged for visibility but pipeline keeps
+            # previous base (coords_ca, z_current) to avoid cascading from
+            # low-confidence structures.
+            if not step_result.rejected:
+                prev_rmsd = step_result.rmsd
+                coords_ca = step_result.new_ca
+                z_current = step_result.z_modified
 
         if verbose:
             print(f"{'-'*len(header)}")
@@ -918,6 +957,9 @@ class ModeDrivePipeline:
             fallbacks = [r.fallback_level for r in result.step_results if r.fallback_level > 0]
             if fallbacks:
                 print(f"Fallback triggered: {len(fallbacks)}/{len(result.step_results)} steps (levels: {fallbacks})")
+            rejected = [i for i, r in enumerate(result.step_results) if r.rejected]
+            if rejected:
+                print(f"Rejected (base preserved): {len(rejected)}/{len(result.step_results)} steps (indices: {rejected})")
             print()
 
         return result
