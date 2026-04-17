@@ -30,8 +30,10 @@ from .losses import focal_loss, contact_loss, gnm_loss, reconstruction_loss, tot
 # Mode combinator
 from .mode_combinator import ModeCombo, collectivity_combinations, grid_combinations, random_combinations, targeted_combinations
 
-# Mode drive
-from .mode_drive import ModeDriveConfig, ModeDrivePipeline, ModeDriveResult, StepResult, compute_rmsd, kabsch_superimpose, tm_score, make_pseudo_diffusion
+# Mode drive (config, utils, pipeline)
+from .mode_drive_config import ModeDriveConfig, ModeDriveResult, StepResult
+from .mode_drive_utils import compute_rmsd, kabsch_superimpose, tm_score, make_pseudo_diffusion
+from .mode_drive import ModeDrivePipeline
 
 # OF3 diffusion (lazy import — requires openfold3-repo)
 def load_of3_diffusion(*args, **kwargs):

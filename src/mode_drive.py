@@ -4,26 +4,23 @@ Combines ANM normal-mode displacements with OF3 diffusion to generate
 physically meaningful protein conformational ensembles.
 
 Pipeline:
-    coords → ANM modes → collectivity rank → displace → contact → z_pseudo → blend z → diffusion → new coords → repeat
+    coords -> ANM modes -> collectivity rank -> displace -> contact -> z_pseudo -> blend z -> diffusion -> new coords -> repeat
 
 Strategy (goal: maximize displacement from initial structure):
     1. Compute ANM modes and rank combinations by collectivity
     2. Try most collective combo first with df_min
-    3. If RMSD from initial doesn't increase → try next combo
-    4. If all combos exhausted → escalate df toward df_max
+    3. If RMSD from initial doesn't increase -> try next combo
+    4. If all combos exhausted -> escalate df toward df_max
     5. Run exactly n_steps iterations (no early stopping)
 
-RMSD is measured from INITIAL structure — higher = more exploration.
+RMSD is measured from INITIAL structure -- higher = more exploration.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from functools import partial
 from typing import Callable
 
 import torch
-import torch.nn as nn
 
 from .anm import anm_bfactors, anm_modes, build_hessian, collectivity, displace
 from .converter import PairContactConverter
@@ -35,6 +32,23 @@ from .mode_combinator import (
     random_combinations,
     targeted_combinations,
 )
+
+# Re-export config/result dataclasses and utility functions so existing
+# `from src.mode_drive import ModeDriveConfig, ...` keeps working.
+from .mode_drive_config import ModeDriveConfig, ModeDriveResult, StepResult  # noqa: F401
+from .mode_drive_utils import (  # noqa: F401
+    compute_rmsd,
+    contact_to_distance,
+    classical_mds,
+    kabsch_superimpose,
+    make_pseudo_diffusion,
+    tm_score,
+)
+
+# Backward-compat aliases for the old private names used internally.
+_contact_to_distance = contact_to_distance
+_classical_mds = classical_mds
+
 # Lazy import to avoid pulling OF3 dependencies when not needed
 # DiffusionResult is checked via isinstance at runtime
 try:
@@ -44,341 +58,6 @@ except (ImportError, Exception):
         from src.of3_diffusion import DiffusionResult  # type: ignore[no-redef]
     except (ImportError, Exception):
         DiffusionResult = None  # type: ignore[assignment,misc]
-
-
-@dataclass
-class ModeDriveConfig:
-    """Configuration for the ANM Mode-Drive pipeline."""
-
-    # ANM parameters
-    anm_cutoff: float = 15.0
-    anm_gamma: float = 1.0
-    anm_tau: float = 1.0
-    n_anm_modes: int = 20
-
-    # Contact map parameters
-    contact_r_cut: float = 10.0
-    contact_tau: float = 1.5
-
-    # Pipeline parameters
-    n_steps: int = 5                             # fixed number of steps (no early stop)
-    combination_strategy: str = "collectivity"  # "collectivity", "grid", "random", "targeted", "manual"
-    n_combinations: int = 20
-    z_mixing_alpha: float = 0.3
-    normalize_z: bool = True
-    z_direction: str = "plus"                    # "plus" or "minus": add or subtract delta_z
-
-    # Global displacement factor (collectivity strategy)
-    df: float = 0.6                              # initial global df (Angstrom)
-    df_min: float = 0.3                          # minimum df
-    df_max: float = 3.0                          # maximum df
-    df_escalation_factor: float = 1.5            # multiply df when combos exhausted
-    max_combo_size: int = 3                      # max modes per combination (e.g. 3 or 5)
-
-    # Manual mode selection
-    manual_modes: tuple[int, ...] = ()           # e.g. (0, 1, 2) — mode indices to use
-
-    # Random combinator defaults
-    select_modes_range: tuple[int, int] = (1, 5)
-    df_scale: float = 2.0
-
-    # Grid combinator defaults
-    grid_select_modes: int = 3
-    grid_df_range: tuple[float, float] = (-2.0, 2.0)
-    grid_df_steps: int = 5
-
-    # Targeted combinator defaults
-    targeted_top_modes: int = 5
-
-    # Confidence & multi-sample
-    num_diffusion_samples: int = 1               # K: samples per diffusion call
-    confidence_ptm_cutoff: float = 0.5           # minimum pTM to accept step (0-1)
-    confidence_plddt_cutoff: float = 70.0        # minimum mean pLDDT to accept (0-100 scale, OF3 native)
-    confidence_ranking_cutoff: float = 0.5       # minimum ranking score to accept
-
-    # Adaptive fallback
-    enable_confidence_fallback: bool = False      # enable confidence-guided fallback
-    fallback_combo_tries: int = 3                # Level 1: try next N combos by collectivity
-    fallback_df_factor: float = 0.5              # Level 2: df *= this
-    fallback_max_combo_size: int = 1             # Level 3: reduce to single mode
-    fallback_alpha_factor: float = 0.5           # Level 4: alpha *= this
-    # Level 5: extended (combo × df × alpha) grid search
-    fallback_extended_enabled: bool = True       # enable aggressive grid search when L0-L4 fail
-    fallback_extended_combo_count: int = 10      # top N combos to iterate
-    fallback_extended_df_scales: tuple[float, ...] = (0.5, 0.25)   # df multipliers
-    fallback_extended_alpha_scales: tuple[float, ...] = (0.5, 0.25)  # alpha multipliers
-
-    # ─────────────── Autostop strategy ───────────────
-    # Replaces ANM mode-combo displacement with IW-ENM MD + early-stop picker.
-    # Downstream (coords → contact → z_pseudo → blend → OF3 → QC) is unchanged.
-    autostop_chain_id: str = "A"
-    # Physics
-    autostop_R_bb: float = 11.0
-    autostop_R_sc: float = 2.0
-    autostop_K_0: float = 0.8
-    autostop_d_0: float = 3.8
-    autostop_n_ref: float = 10.0
-    # Integration
-    autostop_dt: float = 0.01
-    autostop_mass: float = 1.0
-    autostop_damping: float = 0.0
-    autostop_v_mode: str = "breathing"
-    autostop_v_magnitude: float = 1.0
-    # Run control
-    autostop_n_steps: int = 5000
-    autostop_save_every: int = 10
-    autostop_back_off: int = 2
-    autostop_back_off_fraction: float | None = None  # if set, back_off = int(tk * fraction); overrides fixed back_off
-    autostop_crash_threshold_distance: float = 0.5
-    # Monitor (early-stop)
-    autostop_smooth_w: int = 11
-    autostop_warmup_frac: float = 0.40
-    autostop_patience: int = 3
-    autostop_eps_E_rel: float = 0.0002
-    autostop_eps_N_rel: float = 0.0005
-    autostop_crash_window_saves: int = 20
-    autostop_crash_threshold: int = 5
-    autostop_min_saves_before_check: int = 15
-    autostop_verbose: bool = True
-
-    # Autostop fallback ladder (L0-L9).
-    # See docs/plans/autostop_integration.md §2.4.
-    # Per-level scale / delta sweeps; each entry is a NEW mutation relative to
-    # the BASELINE config value (not cumulative across levels).
-    autostop_fallback_v_scales: tuple[float, ...] = (1.0, 0.5, 0.25, 0.1)
-    autostop_fallback_back_off_adds: tuple[int, ...] = (0, 2, 4, 8)
-    autostop_fallback_eps_E_scales: tuple[float, ...] = (1.0, 2.0, 0.5, 0.25)
-    autostop_fallback_eps_N_scales: tuple[float, ...] = (1.0, 2.0, 0.5, 0.25)
-    autostop_fallback_patience_deltas: tuple[int, ...] = (0, -1, 1, 2)
-    autostop_fallback_smooth_w_deltas: tuple[int, ...] = (0, 4, -2, 8)
-    autostop_fallback_warmup_frac_scales: tuple[float, ...] = (1.0, 1.5, 0.5)
-    autostop_fallback_crash_window_scales: tuple[float, ...] = (1.0, 2.0, 0.5)
-    autostop_fallback_crash_threshold_adds: tuple[int, ...] = (0, 2, -2)
-    autostop_fallback_alpha_scales: tuple[float, ...] = (1.0, 0.5, 0.25)  # L4/L7 z_mixing_alpha multipliers
-    # Which L0-L9 levels to enable (default: L0 + cheap replay-only levels
-    # L1 back_off and L4 alpha; L9 is forced-accept safety net).
-    # L2/L7 re-run MD (expensive), so they are disabled by default.
-    # L3/L5/L6/L8 are replay-only but user's baseline strategy is
-    # "go back in picked + change alpha" only, so they are off as well.
-    autostop_fallback_levels: tuple[int, ...] = (0, 1, 4, 9)
-    # Max cells per extended grid (L7, L8) — prevents combinatorial blow-up.
-    autostop_fallback_grid_cap: int = 8
-
-
-@dataclass
-class StepResult:
-    """Result from a single pipeline step."""
-
-    combo: ModeCombo
-    displaced_ca: torch.Tensor       # [N, 3]
-    new_ca: torch.Tensor             # [N, 3]
-    z_modified: torch.Tensor         # [N, N, 128]
-    contact_map: torch.Tensor        # [N, N]
-    rmsd: float
-    eigenvalues: torch.Tensor        # [n_modes]
-    eigenvectors: torch.Tensor       # [N, n_modes, 3]
-    b_factors: torch.Tensor          # [N]
-    df_used: float = 0.0             # actual df applied
-    alpha_used: float = 0.0          # actual z_mixing_alpha applied
-
-    # Confidence metrics (populated when multi-sample diffusion is used)
-    plddt: torch.Tensor | None = None         # [N] best sample per-residue pLDDT
-    ptm: float | None = None                  # best sample pTM
-    ranking_score: float | None = None        # best sample ranking
-    all_ptm: torch.Tensor | None = None       # [K] all samples' pTM
-    all_ranking: torch.Tensor | None = None   # [K] all samples' ranking
-    fallback_level: int = 0                   # 0=normal, 1=df, 2=modes, 3=alpha
-    rejected: bool = False                    # True if all fallback levels failed (forced-accept)
-    num_samples: int = 1                      # K diffusion samples used
-
-    # Autostop strategy diagnostics (None when strategy != "autostop")
-    autostop_info: dict | None = None
-
-
-@dataclass
-class ModeDriveResult:
-    """Result from the full iterative pipeline."""
-
-    trajectory: list[torch.Tensor] = field(default_factory=list)
-    step_results: list[StepResult] = field(default_factory=list)
-    total_steps: int = 0
-
-
-def kabsch_superimpose(
-    ref: torch.Tensor,
-    mobile: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Kabsch superimposition: align mobile onto ref.
-
-    Args:
-        ref: [N, 3] reference coordinates
-        mobile: [N, 3] mobile coordinates to align
-
-    Returns:
-        aligned: [N, 3] mobile after optimal rotation+translation
-        rmsd: scalar RMSD after alignment
-    """
-    # 1. Center both
-    ref_center = ref.mean(dim=0)
-    mob_center = mobile.mean(dim=0)
-    ref_centered = ref - ref_center
-    mob_centered = mobile - mob_center
-
-    # 2. Covariance matrix
-    H = mob_centered.T @ ref_centered  # [3, 3]
-
-    # 3. SVD
-    U, S, Vt = torch.linalg.svd(H)
-
-    # 4. Correct reflection
-    d = torch.det(Vt.T @ U.T)
-    sign_matrix = torch.diag(
-        torch.tensor([1.0, 1.0, torch.sign(d)], device=ref.device, dtype=ref.dtype),
-    )
-
-    # 5. Optimal rotation
-    R = Vt.T @ sign_matrix @ U.T
-
-    # 6. Apply
-    aligned = (mob_centered @ R.T) + ref_center
-
-    # 7. RMSD
-    rmsd_val = ((ref - aligned) ** 2).sum(dim=-1).mean().sqrt()
-
-    return aligned, rmsd_val
-
-
-def compute_rmsd(a: torch.Tensor, b: torch.Tensor) -> float:
-    """RMSD between two coordinate sets after Kabsch superimposition [N, 3]."""
-    _, rmsd_val = kabsch_superimpose(a, b)
-    return rmsd_val.item()
-
-
-def tm_score(
-    coords_model: torch.Tensor,
-    coords_ref: torch.Tensor,
-) -> float:
-    """Approximate TM-score between two CA coordinate sets.
-
-    TM-score = (1/N) * sum_i 1 / (1 + (d_i / d0)^2)
-
-    where d_i is per-residue distance after Kabsch superimposition
-    and d0 = 1.24 * (N - 15)^(1/3) - 1.8
-
-    Args:
-        coords_model: [N, 3] model coordinates
-        coords_ref:   [N, 3] reference coordinates
-
-    Returns:
-        TM-score in [0, 1]
-    """
-    aligned, _ = kabsch_superimpose(coords_ref, coords_model)
-    N = coords_ref.shape[0]
-    d0 = 1.24 * (max(N, 16) - 15) ** (1.0 / 3.0) - 1.8
-    d0 = max(d0, 0.5)
-    di = ((coords_ref - aligned) ** 2).sum(dim=-1).sqrt()
-    scores = 1.0 / (1.0 + (di / d0) ** 2)
-    return scores.mean().item()
-
-
-def _contact_to_distance(contact: torch.Tensor, r_cut: float, tau: float) -> torch.Tensor:
-    """Invert sigmoid soft contact to approximate distances.
-
-    d_ij = r_cut - tau * ln(C / (1 - C))
-
-    Args:
-        contact: [N, N] contact probabilities in (0, 1).
-        r_cut:   Cutoff centre used in coords_to_contact.
-        tau:     Sigmoid temperature.
-
-    Returns:
-        dist: [N, N] approximate pairwise distances.
-    """
-    c = contact.clamp(1e-6, 1.0 - 1e-6)
-    logit = torch.log(c / (1.0 - c))  # sigmoid inverse
-    dist = r_cut - tau * logit
-    dist = dist.clamp(min=0.0)
-    dist.fill_diagonal_(0.0)
-    # Symmetrize
-    dist = 0.5 * (dist + dist.T)
-    return dist
-
-
-def _classical_mds(dist_matrix: torch.Tensor, dim: int = 3) -> torch.Tensor:
-    """Classical multidimensional scaling: distance matrix → 3D coordinates.
-
-    Args:
-        dist_matrix: [N, N] symmetric distance matrix.
-        dim: Embedding dimension (3 for 3D coords).
-
-    Returns:
-        coords: [N, dim] embedded coordinates.
-    """
-    N = dist_matrix.shape[0]
-    D2 = dist_matrix ** 2
-
-    # Centering matrix: H = I - (1/N) * 11^T
-    H = torch.eye(N, device=dist_matrix.device, dtype=dist_matrix.dtype) - 1.0 / N
-
-    # Double-centered matrix: B = -0.5 * H * D^2 * H
-    B = -0.5 * H @ D2 @ H
-
-    # Eigendecompose (float64 for stability)
-    B64 = B.to(dtype=torch.float64, device="cpu")
-    vals, vecs = torch.linalg.eigh(B64)
-    vals = vals.to(dtype=dist_matrix.dtype, device=dist_matrix.device)
-    vecs = vecs.to(dtype=dist_matrix.dtype, device=dist_matrix.device)
-
-    # Take top `dim` eigenvalues (largest, at the end)
-    top_vals = vals[-dim:].flip(0).clamp(min=0.0)
-    top_vecs = vecs[:, -dim:].flip(1)
-
-    # Coordinates: X = V * sqrt(Lambda)
-    coords = top_vecs * top_vals.sqrt().unsqueeze(0)
-
-    return coords
-
-
-def make_pseudo_diffusion(
-    converter: PairContactConverter,
-    r_cut: float = 10.0,
-    tau: float = 1.5,
-    reference_coords: torch.Tensor | None = None,
-) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Create a pseudo-diffusion function for testing without OF3.
-
-    Converts blended z_mod back to 3D coordinates via:
-        z_mod → contact (forward head) → distances (invert sigmoid) → MDS → coords
-
-    If reference_coords is provided, the MDS output is Kabsch-aligned
-    to the reference to maintain consistent orientation.
-
-    Args:
-        converter:        Trained PairContactConverter.
-        r_cut:            Contact cutoff used in coords_to_contact.
-        tau:              Sigmoid temperature.
-        reference_coords: [N, 3] coords for alignment (typically initial structure).
-
-    Returns:
-        diffusion_fn: Callable([N, N, 128]) -> [N, 3]
-    """
-    def _pseudo_diffuse(z_mod: torch.Tensor) -> torch.Tensor:
-        # z_mod [N, N, 128] → contact [N, N]
-        contact = converter.z_to_contact(z_mod)
-
-        # contact → approximate distance matrix
-        dist = _contact_to_distance(contact, r_cut, tau)
-
-        # distance → 3D coordinates via classical MDS
-        coords = _classical_mds(dist, dim=3)
-
-        # Align to reference if available
-        if reference_coords is not None:
-            coords, _ = kabsch_superimpose(reference_coords, coords)
-
-        return coords
-
-    return _pseudo_diffuse
 
 
 class ModeDrivePipeline:
@@ -407,7 +86,7 @@ class ModeDrivePipeline:
         converter: PairContactConverter,
         config: ModeDriveConfig | None = None,
         diffusion_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
-        structure_ctx=None,  # autostop_adapter.StructureContext | None — lazy-typed to avoid importing iw_enm unless autostop is actually used
+        structure_ctx=None,  # autostop_adapter.StructureContext | None
     ) -> None:
         self.converter = converter
         self.config = config or ModeDriveConfig()
@@ -415,7 +94,6 @@ class ModeDrivePipeline:
         self.structure_ctx = structure_ctx
 
         # Cache of most-recent autostop trace for cheap fallback replay.
-        # Only populated when combination_strategy == "autostop".
         self._autostop_last_trace = None
         self._autostop_last_coords_key: int | None = None
 
@@ -474,11 +152,7 @@ class ModeDrivePipeline:
         eigenvalues: torch.Tensor,
         df: float,
     ) -> list[ModeCombo]:
-        """Build a single combo from user-specified modes.
-
-        Eigenvalue-weighted normalize + single global df.
-        Returns one combo (the specified modes with normalized df).
-        """
+        """Build a single combo from user-specified modes."""
         modes = self.config.manual_modes
         if not modes:
             raise ValueError("manual strategy requires manual_modes to be set")
@@ -499,14 +173,7 @@ class ModeDrivePipeline:
         z_pseudo: torch.Tensor,
         zij_trunk: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply delta_z to trunk z_ij in the configured direction.
-
-        Computes delta_z = z_pseudo - zij_trunk (the displacement in z-space),
-        then adds (+) or subtracts (-) it scaled by alpha.
-
-        z_direction="plus":  zij_trunk + alpha * delta_z  (move toward displaced state)
-        z_direction="minus": zij_trunk - alpha * delta_z  (move in opposite direction)
-        """
+        """Apply delta_z to trunk z_ij in the configured direction."""
         alpha = self.config.z_mixing_alpha
 
         if self.config.normalize_z:
@@ -531,11 +198,7 @@ class ModeDrivePipeline:
         b_factors: torch.Tensor,
         df_used: float,
     ) -> StepResult:
-        """Evaluate a single mode combination (ANM displace → downstream).
-
-        RMSD is computed from initial_coords_ca (not current iteration),
-        because higher RMSD = more conformational exploration = better.
-        """
+        """Evaluate a single mode combination (ANM displace -> downstream)."""
         device = coords_ca.device
 
         # Select modes
@@ -573,7 +236,7 @@ class ModeDrivePipeline:
         """Common downstream path from a displaced-CA tensor.
 
         Shared by ANM-combo strategies and the autostop strategy:
-        displaced → contact → z_pseudo → blend → diffusion → StepResult.
+        displaced -> contact -> z_pseudo -> blend -> diffusion -> StepResult.
         """
         cfg = self.config
 
@@ -641,11 +304,7 @@ class ModeDrivePipeline:
     # ─────────────── Autostop strategy ───────────────
 
     def _autostop_params(self):
-        """Build AutostopParams dataclass from current config values.
-
-        Reads the *current* config fields — so fallback mutations (which
-        patch config in place under try/finally) are picked up automatically.
-        """
+        """Build AutostopParams dataclass from current config values."""
         from .autostop_adapter import AutostopParams
         cfg = self.config
         return AutostopParams(
@@ -681,11 +340,7 @@ class ModeDrivePipeline:
         picked_step: int,
         turn_k: int,
     ) -> ModeCombo:
-        """Build a placeholder ModeCombo for autostop results.
-
-        Contains no ANM modes — just a descriptive label so downstream
-        code (notebook tables, StepResult serialization) keeps working.
-        """
+        """Build a placeholder ModeCombo for autostop results."""
         return ModeCombo(
             mode_indices=(),
             dfs=(),
@@ -700,13 +355,7 @@ class ModeDrivePipeline:
         zij_trunk: torch.Tensor,
         step_idx: int = 0,
     ) -> StepResult:
-        """Run one autostop MD + downstream evaluation.
-
-        ANM modes are still computed (same cost as other strategies) so
-        StepResult eigenvalues/eigenvectors/b_factors fields remain
-        populated for notebook plots — but autostop does NOT use them
-        for displacement.
-        """
+        """Run one autostop MD + downstream evaluation."""
         from .autostop_adapter import run_autostop_from_tensor
 
         if self.structure_ctx is None:
@@ -752,8 +401,6 @@ class ModeDrivePipeline:
             "save_every": trace.save_every,
         }
 
-        # df_used is 0.0 for autostop (no mode displacement factor).
-        # alpha_used is read by downstream from current cfg (already set).
         return self._downstream_from_displaced(
             combo=combo,
             displaced=pick.picked_ca,
@@ -775,30 +422,10 @@ class ModeDrivePipeline:
         prev_rmsd: float = 0.0,
         target_coords: torch.Tensor | None = None,
     ) -> StepResult:
-        """Run a single ANM mode-drive iteration with df escalation.
-
-        Goal: MAXIMIZE RMSD from initial structure (conformational exploration).
-
-        For collectivity strategy:
-            1. Generate combos ranked by collectivity at df_min
-            2. Try combos in order; accept first that increases RMSD
-            3. If none increase RMSD, escalate df and retry
-            4. Repeat until df_max reached
-
-        Args:
-            coords_ca:         [N, 3] current CA positions.
-            initial_coords_ca: [N, 3] starting CA positions (RMSD reference).
-            zij_trunk:         [N, N, 128] current pair representation.
-            prev_rmsd:         RMSD from previous iteration (to beat).
-            target_coords:     [N, 3] optional target for targeted strategy.
-
-        Returns:
-            StepResult with best combination's outputs.
-        """
+        """Run a single ANM mode-drive iteration with df escalation."""
         cfg = self.config
 
         # Autostop strategy — completely bypasses ANM mode-combo displacement.
-        # Downstream (contact → z_pseudo → blend → diffusion → QC) unchanged.
         if cfg.combination_strategy == "autostop":
             return self._autostop_step(
                 coords_ca=coords_ca,
@@ -813,15 +440,13 @@ class ModeDrivePipeline:
         b_factors = anm_bfactors(eigenvalues, eigenvectors)
         n_modes = eigenvalues.shape[0]
 
-        # Score function: if target given, minimize RMSD to target;
-        # otherwise maximize RMSD from initial.
+        # Score function
         has_target = target_coords is not None
 
         def _score(result: StepResult) -> float:
             if has_target:
-                # Lower RMSD to target = better → negate for maximization
                 return -compute_rmsd(result.new_ca, target_coords)
-            return result.rmsd  # higher RMSD from initial = better
+            return result.rmsd
 
         # For non-collectivity strategies
         if cfg.combination_strategy != "collectivity":
@@ -846,13 +471,11 @@ class ModeDrivePipeline:
             return best
 
         # Collectivity strategy with df escalation
-        # +df and -df pairs are already generated by collectivity_combinations
         current_df = cfg.df_min
         best_overall: StepResult | None = None
         best_overall_score = -float("inf")
 
         while current_df <= cfg.df_max:
-            # Generate combos at current df (includes +df and -df for each subset)
             combos = self._generate_combos(
                 n_modes, coords_ca, eigenvectors, eigenvalues,
                 current_df, target_coords,
@@ -870,9 +493,7 @@ class ModeDrivePipeline:
                     best_overall_score = s
                     best_overall = result
 
-                    # Check improvement vs previous step
                     if has_target:
-                        # Improved if we got closer to target
                         improved = True
                         break
                     elif result.rmsd > prev_rmsd:
@@ -882,10 +503,8 @@ class ModeDrivePipeline:
             if improved:
                 break
 
-            # Escalate df for more displacement
             current_df *= cfg.df_escalation_factor
 
-        # If nothing found (shouldn't happen), fall back to first combo
         if best_overall is None:
             combos = self._generate_combos(
                 n_modes, coords_ca, eigenvectors, eigenvalues,
@@ -899,14 +518,9 @@ class ModeDrivePipeline:
         return best_overall
 
     def _confidence_ok(self, result: StepResult) -> bool:
-        """Check if step result passes ALL confidence cutoffs (AND logic).
-
-        Gates: pTM, mean pLDDT (0-100 scale), ranking_score.
-        If no confidence data is available, passes by default.
-        """
+        """Check if step result passes ALL confidence cutoffs (AND logic)."""
         cfg = self.config
 
-        # No confidence data at all → pass (K=1 without confidence, or disabled)
         if (
             result.ptm is None
             and result.plddt is None
@@ -914,15 +528,12 @@ class ModeDrivePipeline:
         ):
             return True
 
-        # pTM gate
         if result.ptm is not None and result.ptm < cfg.confidence_ptm_cutoff:
             return False
-        # pLDDT gate (OF3 returns 0-100 scale; cutoff must match that scale)
         if result.plddt is not None:
             mean_plddt = result.plddt.mean().item()
             if mean_plddt < cfg.confidence_plddt_cutoff:
                 return False
-        # Ranking gate
         if (
             result.ranking_score is not None
             and result.ranking_score < cfg.confidence_ranking_cutoff
@@ -972,7 +583,6 @@ class ModeDrivePipeline:
         best_ranking = -1.0
 
         def _track(result: StepResult) -> bool:
-            """Track best result, return True if confidence OK."""
             nonlocal best_result, best_ranking
             r_score = result.ranking_score if result.ranking_score is not None else 0.0
             if r_score > best_ranking:
@@ -1042,11 +652,9 @@ class ModeDrivePipeline:
             if _track(result):
                 return result
 
-            # ── Level 5: Extended grid search (combo × df × alpha) ──
-            # Aggressive exploration: iterate over top-N combos with multiple
-            # df and alpha scales. First attempt that passes cutoffs wins.
+            # ── Level 5: Extended grid search (combo x df x alpha) ──
             if cfg.fallback_extended_enabled:
-                cfg.max_combo_size = cfg.fallback_max_combo_size  # single-mode combos
+                cfg.max_combo_size = cfg.fallback_max_combo_size
                 n_ext = min(cfg.fallback_extended_combo_count, len(combos))
                 for ci in range(n_ext):
                     for df_scale in cfg.fallback_extended_df_scales:
@@ -1064,13 +672,11 @@ class ModeDrivePipeline:
                                 return ext_result
 
             # Forced accept: best attempt across all levels.
-            # Mark as rejected so the caller can keep previous base coords.
             assert best_result is not None
             best_result.rejected = True
             return best_result
 
         finally:
-            # ALWAYS restore config — no matter which level returned
             cfg.df = orig_df
             cfg.df_min = orig_df_min
             cfg.max_combo_size = orig_max_combo
@@ -1090,7 +696,7 @@ class ModeDrivePipeline:
         fallback_level: int,
         trace_stats: dict,
     ) -> StepResult:
-        """Build a StepResult from an autostop pick — reused across fallback levels."""
+        """Build a StepResult from an autostop pick -- reused across fallback levels."""
         combo = self._autostop_synthetic_combo(
             step_idx=step_idx,
             picked_step=pick.picked_step_md,
@@ -1135,17 +741,17 @@ class ModeDrivePipeline:
     ) -> StepResult:
         """Run autostop strategy with L0-L9 confidence-guided fallback.
 
-        Levels (see docs/plans/autostop_integration.md §2.4):
+        Levels (see docs/plans/autostop_integration.md S2.4):
             L0: baseline autostop                                (MD + monitor + ds)
-            L1: back_off adds  — replay_monitor                  (no MD)
-            L2: v_magnitude scales — re-run MD                   (RERUN)
-            L3: eps_E/eps_N scales — replay_monitor              (no MD)
-            L4: z_alpha scales — re-run downstream only          (no MD, no monitor)
-            L5: patience deltas — replay_monitor                 (no MD)
-            L6: smooth_w deltas — replay_monitor                 (no MD)
-            L7: grid (v × back_off × alpha) — re-run MD          (RERUN; capped)
-            L8: grid (eps_E × eps_N × patience × smooth_w)       (no MD; capped)
-            L9: skip — forced-accept best-so-far
+            L1: back_off adds  -- replay_monitor                  (no MD)
+            L2: v_magnitude scales -- re-run MD                   (RERUN)
+            L3: eps_E/eps_N scales -- replay_monitor              (no MD)
+            L4: z_alpha scales -- re-run downstream only          (no MD, no monitor)
+            L5: patience deltas -- replay_monitor                 (no MD)
+            L6: smooth_w deltas -- replay_monitor                 (no MD)
+            L7: grid (v x back_off x alpha) -- re-run MD          (RERUN; capped)
+            L8: grid (eps_E x eps_N x patience x smooth_w)       (no MD; capped)
+            L9: skip -- forced-accept best-so-far
 
         `cfg.autostop_fallback_levels` subsets which levels are attempted.
         """
@@ -1158,8 +764,7 @@ class ModeDrivePipeline:
 
         cfg = self.config
 
-        # Save originals for try/finally restoration — includes autostop knobs
-        # touched by mutations and z_mixing_alpha touched by L4/L7.
+        # Save originals for try/finally restoration
         orig_v = cfg.autostop_v_magnitude
         orig_back = cfg.autostop_back_off
         orig_eps_E = cfg.autostop_eps_E_rel
@@ -1187,11 +792,9 @@ class ModeDrivePipeline:
                 best_result = result
             ok = self._confidence_ok(result)
             if cfg.autostop_verbose:
-                # pTM
                 ptm_str = (
                     f"{result.ptm:.3f}" if result.ptm is not None else "  -  "
                 )
-                # mean pLDDT (0-100)
                 if result.plddt is not None:
                     try:
                         plddt_mean = float(result.plddt.mean().item())
@@ -1208,21 +811,20 @@ class ModeDrivePipeline:
                 pk = ai.get("picked_step_md", "-")
                 tk = ai.get("turn_k", "-")
                 tag = "PASS" if ok else "FAIL"
-                # Target metrics (if available)
                 tgt_str = ""
                 if target_coords is not None and result.new_ca is not None:
                     rmsd_t = compute_rmsd(result.new_ca, target_coords)
                     tm_t = tm_score(result.new_ca, target_coords)
-                    tgt_str = f"  RMSD_tgt={rmsd_t:.2f}Å  TM_tgt={tm_t:.3f}"
+                    tgt_str = f"  RMSD_tgt={rmsd_t:.2f}A  TM_tgt={tm_t:.3f}"
                 print(
                     f"      [FB L{level}] {tag}  {desc:<24s}  "
                     f"pk={pk!s:>5} tk={tk!s:>3}  "
                     f"pTM={ptm_str}  pLDDT={plddt_str}  rank={rank_str}  "
-                    f"RMSD_init={result.rmsd:.2f}Å{tgt_str}"
+                    f"RMSD_init={result.rmsd:.2f}A{tgt_str}"
                 )
             return ok
 
-        # Compute ANM modes once for diagnostics — same cost as _autostop_step
+        # Compute ANM modes once for diagnostics
         H = build_hessian(coords_ca, cfg.anm_cutoff, cfg.anm_gamma, cfg.anm_tau)
         eigenvalues, eigenvectors = anm_modes(H, cfg.n_anm_modes)
         b_factors = anm_bfactors(eigenvalues, eigenvectors)
@@ -1231,7 +833,6 @@ class ModeDrivePipeline:
         dtype = coords_ca.dtype
         enabled = set(cfg.autostop_fallback_levels)
 
-        # Will be populated by L0 and reused by cheap levels.
         trace = None
 
         def _trace_stats(tr) -> dict:
@@ -1274,7 +875,7 @@ class ModeDrivePipeline:
                 )
                 if _track(
                     result0, level=0,
-                    desc=f"baseline v={orig_v:.2f} α={orig_alpha:.2f} back={orig_back}",
+                    desc=f"baseline v={orig_v:.2f} a={orig_alpha:.2f} back={orig_back}",
                 ):
                     return result0
 
@@ -1289,7 +890,7 @@ class ModeDrivePipeline:
                 base_mon = self._autostop_params().monitor_only()
                 for add in cfg.autostop_fallback_back_off_adds:
                     if add == 0:
-                        continue  # baseline = L0 already tried
+                        continue
                     new_back = max(0, orig_back + int(add))
                     pick = _replay(base_mon, new_back)
                     res = self._autostop_downstream_from_pick(
@@ -1299,7 +900,7 @@ class ModeDrivePipeline:
                     )
                     if _track(
                         res, level=1,
-                        desc=f"back_off {orig_back}→{new_back} (add={add:+d})",
+                        desc=f"back_off {orig_back}->{new_back} (add={add:+d})",
                     ):
                         return res
 
@@ -1318,7 +919,7 @@ class ModeDrivePipeline:
                     )
                     if _track(
                         res, level=2,
-                        desc=f"v_mag×{scale:.2f}→{cfg.autostop_v_magnitude:.2f} (RERUN MD)",
+                        desc=f"v_mag x{scale:.2f}->{cfg.autostop_v_magnitude:.2f} (RERUN MD)",
                     ):
                         return res
                 cfg.autostop_v_magnitude = orig_v
@@ -1340,12 +941,11 @@ class ModeDrivePipeline:
                         )
                         if _track(
                             res, level=3,
-                            desc=f"eps_E×{se:.1f} eps_N×{sn:.1f}",
+                            desc=f"eps_E x{se:.1f} eps_N x{sn:.1f}",
                         ):
                             return res
 
-            # ── L4: alpha scales (no MD, no monitor rerun — just re-blend) ──
-            # Reuse the BASELINE monitor pick, just change alpha.
+            # ── L4: alpha scales (no MD, no monitor rerun) ──
             if 4 in enabled:
                 base_mon = self._autostop_params().monitor_only()
                 for scale in cfg.autostop_fallback_alpha_scales:
@@ -1360,7 +960,7 @@ class ModeDrivePipeline:
                     )
                     if _track(
                         res, level=4,
-                        desc=f"α×{scale:.2f}→{cfg.z_mixing_alpha:.2f}",
+                        desc=f"a x{scale:.2f}->{cfg.z_mixing_alpha:.2f}",
                     ):
                         return res
                 cfg.z_mixing_alpha = orig_alpha
@@ -1381,7 +981,7 @@ class ModeDrivePipeline:
                     )
                     if _track(
                         res, level=5,
-                        desc=f"patience {orig_patience}→{new_pat} (Δ={delta:+d})",
+                        desc=f"patience {orig_patience}->{new_pat} (d={delta:+d})",
                     ):
                         return res
 
@@ -1401,11 +1001,11 @@ class ModeDrivePipeline:
                     )
                     if _track(
                         res, level=6,
-                        desc=f"smooth_w {orig_smooth_w}→{new_sw} (Δ={delta:+d})",
+                        desc=f"smooth_w {orig_smooth_w}->{new_sw} (d={delta:+d})",
                     ):
                         return res
 
-            # ── L7: grid (v × back_off × alpha) — RERUN MD per v ─────
+            # ── L7: grid (v x back_off x alpha) -- RERUN MD per v ─────
             if 7 in enabled:
                 cap = max(1, int(cfg.autostop_fallback_grid_cap))
                 tried = 0
@@ -1414,7 +1014,7 @@ class ModeDrivePipeline:
                         break
                     cfg.autostop_v_magnitude = orig_v * float(vs)
                     params = self._autostop_params()
-                    pick_base, tr_v = _run_md(params)  # refresh trace under new v
+                    pick_base, tr_v = _run_md(params)
                     for add in cfg.autostop_fallback_back_off_adds:
                         if tried >= cap:
                             break
@@ -1422,7 +1022,7 @@ class ModeDrivePipeline:
                             if tried >= cap:
                                 break
                             if vs == 1.0 and add == 0 and a_scale == 1.0:
-                                continue  # baseline
+                                continue
                             cfg.z_mixing_alpha = orig_alpha * float(a_scale)
                             new_back = max(0, orig_back + int(add))
                             pick = _replay(params.monitor_only(), new_back)
@@ -1435,7 +1035,7 @@ class ModeDrivePipeline:
                             if _track(
                                 res, level=7,
                                 desc=(
-                                    f"grid v×{vs:.2f} back+{add} α×{a_scale:.2f} "
+                                    f"grid v x{vs:.2f} back+{add} a x{a_scale:.2f} "
                                     f"(RERUN MD)"
                                 ),
                             ):
@@ -1476,7 +1076,7 @@ class ModeDrivePipeline:
                                 if _track(
                                     res, level=8,
                                     desc=(
-                                        f"grid eps_E×{se:.1f} eps_N×{sn:.1f} "
+                                        f"grid eps_E x{se:.1f} eps_N x{sn:.1f} "
                                         f"pat{dp:+d} sw{ds:+d}"
                                     ),
                                 ):
@@ -1490,9 +1090,9 @@ class ModeDrivePipeline:
                     best_result.autostop_info["fallback_level"] = 9
                 if cfg.autostop_verbose:
                     print(
-                        f"      [FB L9] FORCE  all attempts failed confidence → "
+                        f"      [FB L9] FORCE  all attempts failed confidence -> "
                         f"accepting best-so-far (rank={best_ranking:.3f}, "
-                        f"RMSD_init={best_result.rmsd:.2f}Å)"
+                        f"RMSD_init={best_result.rmsd:.2f}A)"
                     )
                 return best_result
 
@@ -1507,13 +1107,12 @@ class ModeDrivePipeline:
             res.rejected = True
             if cfg.autostop_verbose:
                 print(
-                    f"      [FB L9] FORCE  no prior attempts tracked → "
+                    f"      [FB L9] FORCE  no prior attempts tracked -> "
                     f"hard baseline accepted (rejected=True)"
                 )
             return res
 
         finally:
-            # ALWAYS restore — even if a level returned successfully.
             cfg.autostop_v_magnitude = orig_v
             cfg.autostop_back_off = orig_back
             cfg.autostop_eps_E_rel = orig_eps_E
@@ -1533,35 +1132,21 @@ class ModeDrivePipeline:
         target_coords: torch.Tensor | None = None,
         verbose: bool = True,
     ) -> ModeDriveResult:
-        """Run the full iterative ANM mode-drive pipeline.
-
-        Runs exactly n_steps iterations (no early stopping).
-        Each step tries to INCREASE RMSD from initial structure
-        (maximize conformational exploration).
-
-        Args:
-            initial_coords_ca: [N, 3] starting CA positions.
-            zij_trunk:         [N, N, 128] trunk pair representation.
-            target_coords:     [N, 3] optional target structure.
-            verbose:           Print live RMSD/TM-score per step.
-
-        Returns:
-            ModeDriveResult with trajectory and per-step results.
-        """
+        """Run the full iterative ANM mode-drive pipeline."""
         cfg = self.config
         result = ModeDriveResult()
         result.trajectory.append(initial_coords_ca.clone())
 
         coords_ca = initial_coords_ca
         z_current = zij_trunk
-        prev_rmsd = 0.0  # initial RMSD from self = 0
+        prev_rmsd = 0.0
 
         use_fallback = cfg.enable_confidence_fallback
 
         if verbose:
             N = initial_coords_ca.shape[0]
             has_target = target_coords is not None
-            header = f"{'Step':>6} {'RMSD_init':>10} {'df':>6} {'α':>5} {'Combo':>20}"
+            header = f"{'Step':>6} {'RMSD_init':>10} {'df':>6} {'a':>5} {'Combo':>20}"
             if has_target:
                 header += f" {'RMSD_tgt':>10} {'TM_tgt':>8}"
             header += f" {'pTM':>6} {'pLDDT':>6} {'FB':>3}"
@@ -1577,12 +1162,12 @@ class ModeDrivePipeline:
             print(f"{'-'*len(header)}")
 
             # Initial state
-            init_line = f"{'Init':>6} {'0.000':>10} {'—':>6} {'—':>5} {'—':>20}"
+            init_line = f"{'Init':>6} {'0.000':>10} {'-':>6} {'-':>5} {'-':>20}"
             if has_target:
                 rmsd_tgt = compute_rmsd(initial_coords_ca, target_coords)
                 tm_tgt = tm_score(initial_coords_ca, target_coords)
                 init_line += f" {rmsd_tgt:>10.3f} {tm_tgt:>8.4f}"
-            init_line += f" {'—':>6} {'—':>6} {'—':>3}"
+            init_line += f" {'-':>6} {'-':>6} {'-':>3}"
             print(init_line)
 
         for step_idx in range(cfg.n_steps):
@@ -1602,17 +1187,17 @@ class ModeDrivePipeline:
 
             if verbose:
                 combo_label = step_result.combo.label[:20]
-                ptm_str = f"{step_result.ptm:.3f}" if step_result.ptm is not None else "—"
+                ptm_str = f"{step_result.ptm:.3f}" if step_result.ptm is not None else "-"
                 plddt_str = (
                     f"{step_result.plddt.mean().item():.3f}"
-                    if step_result.plddt is not None else "—"
+                    if step_result.plddt is not None else "-"
                 )
                 if step_result.rejected:
                     fb_str = f"!{step_result.fallback_level}"
                 elif step_result.fallback_level > 0:
                     fb_str = str(step_result.fallback_level)
                 else:
-                    fb_str = "—"
+                    fb_str = "-"
 
                 line = (
                     f"{step_idx+1:>6} "
@@ -1629,9 +1214,6 @@ class ModeDrivePipeline:
                 print(line)
 
             # Update for next step only if not rejected.
-            # Rejected steps are logged for visibility but pipeline keeps
-            # previous base (coords_ca, z_current) to avoid cascading from
-            # low-confidence structures.
             if not step_result.rejected:
                 prev_rmsd = step_result.rmsd
                 coords_ca = step_result.new_ca
@@ -1648,7 +1230,7 @@ class ModeDrivePipeline:
             # Confidence summary
             ptms = [r.ptm for r in result.step_results if r.ptm is not None]
             if ptms:
-                print(f"pTM range: {min(ptms):.3f} — {max(ptms):.3f}")
+                print(f"pTM range: {min(ptms):.3f} - {max(ptms):.3f}")
             fallbacks = [r.fallback_level for r in result.step_results if r.fallback_level > 0]
             if fallbacks:
                 print(f"Fallback triggered: {len(fallbacks)}/{len(result.step_results)} steps (levels: {fallbacks})")

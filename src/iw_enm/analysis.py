@@ -1,4 +1,9 @@
-"""Energy, RMSD, RMSF analysis."""
+"""Energy, RMSD, RMSF analysis (numpy backend for IW-ENM MD trajectories).
+
+Note: src/mode_drive_utils.py has torch-tensor equivalents of kabsch/RMSD/TM-score
+for the Mode-Drive pipeline.  These numpy versions are used by the IW-ENM simulation
+and autostop paths which operate on numpy arrays.
+"""
 
 import numpy as np
 
