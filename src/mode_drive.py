@@ -959,6 +959,7 @@ class ModeDrivePipeline:
                 initial_coords_ca=initial_coords_ca,
                 zij_trunk=zij_trunk,
                 step_idx=0,
+                target_coords=target_coords,
             )
 
         # Save originals
@@ -1130,6 +1131,7 @@ class ModeDrivePipeline:
         initial_coords_ca: torch.Tensor,
         zij_trunk: torch.Tensor,
         step_idx: int = 0,
+        target_coords: torch.Tensor | None = None,
     ) -> StepResult:
         """Run autostop strategy with L0-L9 confidence-guided fallback.
 
@@ -1206,11 +1208,17 @@ class ModeDrivePipeline:
                 pk = ai.get("picked_step_md", "-")
                 tk = ai.get("turn_k", "-")
                 tag = "PASS" if ok else "FAIL"
+                # Target metrics (if available)
+                tgt_str = ""
+                if target_coords is not None and result.new_ca is not None:
+                    rmsd_t = compute_rmsd(result.new_ca, target_coords)
+                    tm_t = tm_score(result.new_ca, target_coords)
+                    tgt_str = f"  RMSD_tgt={rmsd_t:.2f}Å  TM_tgt={tm_t:.3f}"
                 print(
                     f"      [FB L{level}] {tag}  {desc:<24s}  "
                     f"pk={pk!s:>5} tk={tk!s:>3}  "
                     f"pTM={ptm_str}  pLDDT={plddt_str}  rank={rank_str}  "
-                    f"RMSD_init={result.rmsd:.2f}Å"
+                    f"RMSD_init={result.rmsd:.2f}Å{tgt_str}"
                 )
             return ok
 
