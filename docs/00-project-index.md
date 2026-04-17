@@ -34,6 +34,12 @@ Anisotropic Network Model (ANM) tabanli protein dinamik analizi ile OpenFold3 ya
 - [[setup/conda-setup]] - Conda ortam kurulumu
 - [[setup/installation]] - OpenFold3 kurulum rehberi
 
+### Research
+- [[research/alpha_scheduling_strategies]] - Alpha zamanlama stratejileri (cosine decay, per-residue, cyclical)
+- [[research/enm_early_stopping_criteria]] - IW-ENM MD erken durma kriterleri ve back-off analizi
+- [[research/code_review_findings]] - Kod inceleme bulguları, bug'lar, coverage raporu, pipeline gözlemleri
+- [[research/confidence_metrics_analysis]] - Confidence metrikleri analizi: pLDDT sınırlamaları, PAE/sample tutarlılığı, cascade failure çözümleri
+
 ### Plans
 - [[IMPLEMENTATION_PLAN]] - Scale-up plan: 2000 PDB fine-tuning
 
