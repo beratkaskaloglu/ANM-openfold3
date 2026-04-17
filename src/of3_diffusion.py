@@ -313,10 +313,15 @@ def load_of3_diffusion(
 
                 ptm_f = 0.0
                 ranking_val = 0.0
+                # Prefer OF3's own ranking (already 0-1 normalized)
+                of3_rank = confidence.get("sample_ranking_score")
+                if of3_rank is not None:
+                    ranking_val = of3_rank.squeeze().item() if isinstance(of3_rank, torch.Tensor) else float(of3_rank)
                 if ptm is not None:
                     ptm_f = ptm.item() if ptm.dim() == 0 else ptm.mean().item()
-                    plddt_f = plddt.mean().item() if plddt is not None else 0.0
-                    ranking_val = 0.8 * ptm_f + 0.2 * plddt_f
+                    if of3_rank is None:
+                        plddt_f = plddt.mean().item() / 100.0 if plddt is not None else 0.0
+                        ranking_val = 0.8 * ptm_f + 0.2 * plddt_f
 
                 return DiffusionResult(
                     all_ca=all_ca.to(z_mod.device),
@@ -361,13 +366,18 @@ def load_of3_diffusion(
             else:
                 ptm = None
 
-            # Ranking: 0.8 * pTM + 0.2 * mean(pLDDT)
-            if ptm is not None and plddt is not None:
-                ranking = 0.8 * ptm + 0.2 * plddt.mean(dim=-1)
+            # Ranking: prefer OF3's own sample_ranking_score (0-1 normalized)
+            of3_rank = confidence.get("sample_ranking_score")
+            if of3_rank is not None:
+                ranking = of3_rank.squeeze(0) if of3_rank.dim() > 1 else of3_rank
+                if ranking.dim() == 0:
+                    ranking = ranking.unsqueeze(0).expand(K)
+            elif ptm is not None and plddt is not None:
+                ranking = 0.8 * ptm + 0.2 * plddt.mean(dim=-1) / 100.0
             elif ptm is not None:
                 ranking = ptm
             else:
-                ranking = plddt.mean(dim=-1) if plddt is not None else torch.zeros(K)
+                ranking = plddt.mean(dim=-1) / 100.0 if plddt is not None else torch.zeros(K)
 
             best_idx = ranking.argmax().item()
         else:
