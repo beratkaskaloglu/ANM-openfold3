@@ -49,15 +49,11 @@ from .mode_drive_utils import (  # noqa: F401
 _contact_to_distance = contact_to_distance
 _classical_mds = classical_mds
 
-# Lazy import to avoid pulling OF3 dependencies when not needed
-# DiffusionResult is checked via isinstance at runtime
+# Lazy import — DiffusionResult is only needed when OF3 is available.
 try:
     from .of3_diffusion import DiffusionResult
 except (ImportError, Exception):
-    try:
-        from src.of3_diffusion import DiffusionResult  # type: ignore[no-redef]
-    except (ImportError, Exception):
-        DiffusionResult = None  # type: ignore[assignment,misc]
+    DiffusionResult = None  # type: ignore[assignment,misc]
 
 
 class ModeDrivePipeline:

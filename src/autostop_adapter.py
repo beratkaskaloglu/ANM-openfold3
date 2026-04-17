@@ -38,21 +38,13 @@ import numpy as np
 import torch
 from scipy.spatial import cKDTree
 
-# Vendored iw_enm lives at src/iw_enm/*.
-# Two import paths are supported so this works whether the caller puts
-# `src/` on PYTHONPATH (tests) or the project root on PYTHONPATH (notebooks).
-try:
-    from iw_enm.analysis import compute_kinetic_energy
-    from iw_enm.config import SimulationConfig
-    from iw_enm.integrator import VelocityVerletIntegrator
-    from iw_enm.network import InteractionWeightedENM
-    from iw_enm.structure import ProteinStructure
-except ImportError:  # pragma: no cover — notebook-style import
-    from src.iw_enm.analysis import compute_kinetic_energy
-    from src.iw_enm.config import SimulationConfig
-    from src.iw_enm.integrator import VelocityVerletIntegrator
-    from src.iw_enm.network import InteractionWeightedENM
-    from src.iw_enm.structure import ProteinStructure
+# Vendored iw_enm lives at src/iw_enm/* — use relative imports since
+# this module is inside the src package.
+from .iw_enm.analysis import compute_kinetic_energy
+from .iw_enm.config import SimulationConfig
+from .iw_enm.integrator import VelocityVerletIntegrator
+from .iw_enm.network import InteractionWeightedENM
+from .iw_enm.structure import ProteinStructure
 
 
 # ======================================================================
