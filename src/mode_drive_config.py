@@ -110,6 +110,7 @@ class ModeDriveConfig:
     # the BASELINE config value (not cumulative across levels).
     autostop_fallback_v_scales: tuple[float, ...] = (1.0, 0.5, 0.25, 0.1)
     autostop_fallback_back_off_adds: tuple[int, ...] = (0, 2, 4, 8)
+    autostop_fallback_pick_fractions: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125)  # L1: pk = tk * frac (1.0=turn point, 0.5=halfway, etc.)
     autostop_fallback_eps_E_scales: tuple[float, ...] = (1.0, 2.0, 0.5, 0.25)
     autostop_fallback_eps_N_scales: tuple[float, ...] = (1.0, 2.0, 0.5, 0.25)
     autostop_fallback_patience_deltas: tuple[int, ...] = (0, -1, 1, 2)

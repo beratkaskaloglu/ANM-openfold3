@@ -56,6 +56,9 @@ except (ImportError, Exception):
     DiffusionResult = None  # type: ignore[assignment,misc]
 
 
+_SENTINEL = object()  # default-from-config marker for _replay
+
+
 class ModeDrivePipeline:
     """Iterative ANM mode-driven conformational exploration.
 
@@ -848,15 +851,20 @@ class ModeDrivePipeline:
             self._autostop_last_coords_key = id(coords_ca)
             return pick_loc, tr_loc
 
-        def _replay(monitor_params: dict, back_off: int):
+        def _replay(
+            monitor_params: dict,
+            back_off: int,
+            back_off_fraction: float | None = _SENTINEL,
+        ):
             assert trace is not None
+            frac = cfg.autostop_back_off_fraction if back_off_fraction is _SENTINEL else back_off_fraction
             return replay_monitor(
                 trace=trace,
                 monitor_params=monitor_params,
                 back_off=int(back_off),
                 device=device,
                 dtype=dtype,
-                back_off_fraction=cfg.autostop_back_off_fraction,
+                back_off_fraction=frac,
             )
 
         try:
@@ -881,14 +889,17 @@ class ModeDrivePipeline:
                 pick_boot, tr_boot = _run_md(params_boot)
                 _ = pick_boot
 
-            # ── L1: back_off adds (replay only) ──────────────────────
+            # ── L1: pick_fractions — progressively earlier frames ─────
+            # pk = tk * frac: 1.0 = turn point, 0.5 = halfway back, etc.
+            # This replaces fixed back_off adds with proportional stepping.
             if 1 in enabled:
                 base_mon = self._autostop_params().monitor_only()
-                for add in cfg.autostop_fallback_back_off_adds:
-                    if add == 0:
-                        continue
-                    new_back = max(0, orig_back + int(add))
-                    pick = _replay(base_mon, new_back)
+                for frac in cfg.autostop_fallback_pick_fractions:
+                    if frac >= 1.0:
+                        continue  # baseline (L0) already tried
+                    # back_off_fraction = 1 - frac  →  pk = tk * frac
+                    bo_frac = 1.0 - float(frac)
+                    pick = _replay(base_mon, orig_back, back_off_fraction=bo_frac)
                     res = self._autostop_downstream_from_pick(
                         pick, initial_coords_ca, zij_trunk,
                         eigenvalues, eigenvectors, b_factors,
@@ -896,7 +907,7 @@ class ModeDrivePipeline:
                     )
                     if _track(
                         res, level=1,
-                        desc=f"back_off {orig_back}->{new_back} (add={add:+d})",
+                        desc=f"pk=tk*{frac:.2f} (bo_frac={bo_frac:.2f})",
                     ):
                         return res
 
