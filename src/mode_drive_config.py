@@ -123,7 +123,7 @@ class ModeDriveConfig:
     autostop_fallback_warmup_frac_scales: tuple[float, ...] = (1.0, 1.5, 0.5)
     autostop_fallback_crash_window_scales: tuple[float, ...] = (1.0, 2.0, 0.5)
     autostop_fallback_crash_threshold_adds: tuple[int, ...] = (0, 2, -2)
-    autostop_fallback_alpha_scales: tuple[float, ...] = (1.0, 0.5, 0.25)  # L4/L7 z_mixing_alpha multipliers
+    autostop_fallback_alpha_scales: tuple[float, ...] = (1.0, 0.5, 0.35, 0.25, 0.15, 0.07)  # L4/L7 z_mixing_alpha multipliers
     # Which L0-L9 levels to enable (default: L0 + cheap replay-only levels
     # L1 back_off and L4 alpha; L9 is forced-accept safety net).
     # L2/L7 re-run MD (expensive), so they are disabled by default.

@@ -52,8 +52,10 @@ class TestContactProjectionHead:
     def test_param_count(self):
         head = ContactProjectionHead(c_z=128, bottleneck_dim=32)
         total = sum(p.numel() for p in head.parameters())
-        # W_enc: 128*32=4096, v: 32, W_dec: 32*128=4096 → 8224
-        assert total == 8224
+        # W_enc: 128*32=4096, v: 32, W_dec: 32*128=4096,
+        # w_inv: Linear(1,32)=64 + Linear(32,128)=4224 → 4288
+        # Total: 4096 + 32 + 4096 + 4288 = 12512
+        assert total == 12512
 
 
 class TestInversePath:
@@ -76,12 +78,22 @@ class TestInversePath:
             pseudo_z, pseudo_z.transpose(0, 1), atol=1e-5
         )
 
-    def test_inverse_no_grad(self):
-        """Inverse path should not track gradients."""
+    def test_inverse_differentiable(self):
+        """Inverse path is differentiable through w_inv params."""
         head = ContactProjectionHead(c_z=128, bottleneck_dim=32)
         c = torch.rand(6, 6) * 0.8 + 0.1
         c = 0.5 * (c + c.T)
         pseudo_z = head.inverse(c)
+        # w_inv makes output differentiable w.r.t. model params
+        assert pseudo_z.requires_grad
+
+    def test_inverse_no_grad_context(self):
+        """Caller can suppress gradients with torch.no_grad()."""
+        head = ContactProjectionHead(c_z=128, bottleneck_dim=32)
+        c = torch.rand(6, 6) * 0.8 + 0.1
+        c = 0.5 * (c + c.T)
+        with torch.no_grad():
+            pseudo_z = head.inverse(c)
         assert not pseudo_z.requires_grad
 
 

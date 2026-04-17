@@ -81,7 +81,7 @@ def compute_tm_score(coords, ref_coords, L=None):
     aligned, _, _ = kabsch_align(coords, ref_coords)
     if L is None:
         L = len(ref_coords)
-    d0 = 1.24 * (L - 15) ** (1.0 / 3.0) - 1.8
+    d0 = 1.24 * np.cbrt(L - 15) - 1.8
     d0 = max(d0, 0.5)
     di = np.sqrt(np.sum((aligned - ref_coords) ** 2, axis=1))
     tm = np.sum(1.0 / (1.0 + (di / d0) ** 2)) / L

@@ -122,11 +122,15 @@ class TestTrainableHead:
     def test_gradient_flows_to_head(self):
         model = _make_model(n_res=6)
         out = model(_make_batch(n_res=6))
-        # Use both C_pred and pair_repr_recon so gradients reach all head params
+        # Use both C_pred and pair_repr_recon so gradients reach forward-path params
         loss = out["C_pred"].sum() + out["pair_repr_recon"].sum()
         loss.backward()
+        # Forward path uses w_enc, v, w_dec; w_inv is inverse-only
+        forward_params = {"w_enc", "v", "w_dec"}
         for name, param in model.contact_head.named_parameters():
-            assert param.grad is not None, f"No gradient for {name}"
+            top_name = name.split(".")[0]
+            if top_name in forward_params:
+                assert param.grad is not None, f"No gradient for {name}"
 
     def test_no_gradient_to_trunk(self):
         model = _make_model(n_res=6)
@@ -139,17 +143,17 @@ class TestTrainableHead:
 
 class TestParamCount:
     def test_trainable_param_count_default(self):
-        """Default bottleneck_dim=32: W_enc(128*32) + v(32) + W_dec(32*128) = 8224."""
+        """Default bottleneck_dim=32: W_enc(4096) + v(32) + W_dec(4096) + w_inv(4288) = 12512."""
         model = _make_model(c_z=128, bottleneck_dim=32)
         trainable = sum(
             p.numel() for p in model.contact_head.parameters() if p.requires_grad
         )
-        assert trainable == 8224
+        assert trainable == 12512
 
     def test_trainable_param_count_small(self):
-        """bottleneck_dim=16: W_enc(64*16) + v(16) + W_dec(16*64) = 2064."""
+        """bottleneck_dim=16: W_enc(1024) + v(16) + W_dec(1024) + w_inv(1120) = 3184."""
         model = _make_model(c_z=64, bottleneck_dim=16)
         trainable = sum(
             p.numel() for p in model.contact_head.parameters() if p.requires_grad
         )
-        assert trainable == 2064
+        assert trainable == 3184
