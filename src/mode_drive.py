@@ -35,7 +35,7 @@ from .mode_combinator import (
 
 # Re-export config/result dataclasses and utility functions so existing
 # `from src.mode_drive import ModeDriveConfig, ...` keeps working.
-from .mode_drive_config import ModeDriveConfig, ModeDriveResult, StepResult  # noqa: F401
+from .mode_drive_config import CombinationStrategy, ModeDriveConfig, ModeDriveResult, StepResult  # noqa: F401
 from .mode_drive_utils import (  # noqa: F401
     compute_rmsd,
     contact_to_distance,
@@ -44,10 +44,6 @@ from .mode_drive_utils import (  # noqa: F401
     make_pseudo_diffusion,
     tm_score,
 )
-
-# Backward-compat aliases for the old private names used internally.
-_contact_to_distance = contact_to_distance
-_classical_mds = classical_mds
 
 # Lazy import — DiffusionResult is only needed when OF3 is available.
 try:
@@ -378,38 +374,16 @@ class ModeDrivePipeline:
         self._autostop_last_trace = trace
         self._autostop_last_coords_key = id(coords_ca)
 
-        combo = self._autostop_synthetic_combo(
-            step_idx=step_idx,
-            picked_step=pick.picked_step_md,
-            turn_k=pick.turn_k,
-        )
-
-        autostop_info = {
-            "picked_save_index": pick.picked_save_index,
-            "picked_step_md": pick.picked_step_md,
-            "turn_k": pick.turn_k,
-            "argmin_E_k": pick.argmin_E_k,
-            "argmin_N_k": pick.argmin_N_k,
-            "stop_step_md": pick.stop_step_md,
-            "crashes_total": pick.crashes_total,
-            "back_off_used": pick.back_off_used,
-            "monitor_params": dict(pick.monitor_params),
-            "stop_reason": pick.stop_reason,
+        trace_stats = {
             "n_saves": int(len(trace.steps)),
             "total_mdsteps_requested": trace.total_mdsteps_requested,
             "save_every": trace.save_every,
         }
 
-        return self._downstream_from_displaced(
-            combo=combo,
-            displaced=pick.picked_ca,
-            initial_coords_ca=initial_coords_ca,
-            zij_trunk=zij_trunk,
-            eigenvalues=eigenvalues,
-            eigenvectors=eigenvectors,
-            b_factors=b_factors,
-            df_used=0.0,
-            autostop_info=autostop_info,
+        return self._autostop_downstream_from_pick(
+            pick, initial_coords_ca, zij_trunk,
+            eigenvalues, eigenvectors, b_factors,
+            step_idx, fallback_level=0, trace_stats=trace_stats,
         )
 
     @torch.no_grad()
@@ -420,6 +394,7 @@ class ModeDrivePipeline:
         zij_trunk: torch.Tensor,
         prev_rmsd: float = 0.0,
         target_coords: torch.Tensor | None = None,
+        step_idx: int = 0,
     ) -> StepResult:
         """Run a single ANM mode-drive iteration with df escalation."""
         cfg = self.config
@@ -430,7 +405,7 @@ class ModeDrivePipeline:
                 coords_ca=coords_ca,
                 initial_coords_ca=initial_coords_ca,
                 zij_trunk=zij_trunk,
-                step_idx=0,
+                step_idx=step_idx,
             )
 
         # Step 1: ANM Hessian + Eigendecomposition
@@ -548,6 +523,7 @@ class ModeDrivePipeline:
         zij_trunk: torch.Tensor,
         prev_rmsd: float = 0.0,
         target_coords: torch.Tensor | None = None,
+        step_idx: int = 0,
     ) -> StepResult:
         """Run step with confidence-guided adaptive fallback.
 
@@ -568,7 +544,7 @@ class ModeDrivePipeline:
                 coords_ca=coords_ca,
                 initial_coords_ca=initial_coords_ca,
                 zij_trunk=zij_trunk,
-                step_idx=0,
+                step_idx=step_idx,
                 target_coords=target_coords,
             )
 
@@ -600,9 +576,10 @@ class ModeDrivePipeline:
                 return result
 
             # ── Level 1: Try next combos by collectivity ──
-            H = build_hessian(coords_ca, cfg.anm_cutoff, cfg.anm_gamma, cfg.anm_tau)
-            eigenvalues, eigenvectors = anm_modes(H, cfg.n_anm_modes)
-            b_factors = anm_bfactors(eigenvalues, eigenvectors)
+            # Reuse ANM modes from L0's step result (avoids redundant O(N^3) eigendecomposition)
+            eigenvalues = result.eigenvalues
+            eigenvectors = result.eigenvectors
+            b_factors = result.b_factors
             n_modes = eigenvalues.shape[0]
 
             combos = self._generate_combos(
@@ -1181,12 +1158,12 @@ class ModeDrivePipeline:
             if use_fallback:
                 step_result = self.step_with_fallback(
                     coords_ca, initial_coords_ca, z_current,
-                    prev_rmsd, target_coords,
+                    prev_rmsd, target_coords, step_idx=step_idx,
                 )
             else:
                 step_result = self.step(
                     coords_ca, initial_coords_ca, z_current,
-                    prev_rmsd, target_coords,
+                    prev_rmsd, target_coords, step_idx=step_idx,
                 )
             result.step_results.append(step_result)
             result.trajectory.append(step_result.new_ca.clone())
@@ -1226,7 +1203,7 @@ class ModeDrivePipeline:
                 coords_ca = step_result.new_ca
                 z_current = step_result.z_modified
 
-        if verbose:
+        if verbose and result.step_results:
             print(f"{'-'*len(header)}")
             final_rmsd = result.step_results[-1].rmsd
             print(f"Final RMSD from initial: {final_rmsd:.3f} A")

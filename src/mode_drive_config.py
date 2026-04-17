@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
 
 from .mode_combinator import ModeCombo
+
+CombinationStrategy = Literal[
+    "collectivity", "grid", "random", "targeted", "manual", "autostop",
+]
 
 
 @dataclass
@@ -25,7 +30,7 @@ class ModeDriveConfig:
 
     # Pipeline parameters
     n_steps: int = 5                             # fixed number of steps (no early stop)
-    combination_strategy: str = "collectivity"  # "collectivity", "grid", "random", "targeted", "manual"
+    combination_strategy: CombinationStrategy = "collectivity"
     n_combinations: int = 20
     z_mixing_alpha: float = 0.3
     normalize_z: bool = True
@@ -151,7 +156,7 @@ class StepResult:
     ranking_score: float | None = None        # best sample ranking
     all_ptm: torch.Tensor | None = None       # [K] all samples' pTM
     all_ranking: torch.Tensor | None = None   # [K] all samples' ranking
-    fallback_level: int = 0                   # 0=normal, 1=df, 2=modes, 3=alpha
+    fallback_level: int = 0                   # 0=normal, 1-8=fallback level, 9=forced-accept
     rejected: bool = False                    # True if all fallback levels failed (forced-accept)
     num_samples: int = 1                      # K diffusion samples used
 
