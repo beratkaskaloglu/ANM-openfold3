@@ -54,6 +54,85 @@ class DiffusionResult:
     consensus_score: float | None = None       # 1/(1 + mean_inter_sample_rmsd)
 
 
+# ── V2 confidence helpers (module-level for testability) ──────────
+
+
+def _extract_pae(
+    confidence: dict | None, best_idx: int = 0,
+) -> tuple[torch.Tensor | None, float | None]:
+    """Extract PAE matrix for best sample. Returns (pae, mean_pae)."""
+    if confidence is None:
+        return None, None
+    pae_raw = confidence.get("pae")
+    if pae_raw is None:
+        return None, None
+    # pae_raw: [1, K, N, N] or [1, N, N]
+    pae = pae_raw.squeeze(0)  # [K, N, N] or [N, N]
+    if pae.dim() == 3:
+        pae_best = pae[best_idx]  # [N, N]
+    else:
+        pae_best = pae  # [N, N]
+    mean_pae = float(pae_best.mean().item())
+    return pae_best.detach().cpu(), mean_pae
+
+
+def _extract_contact_probs(confidence: dict | None) -> torch.Tensor | None:
+    """Extract OF3 distogram-derived contact probabilities."""
+    if confidence is None:
+        return None
+    cp_raw = confidence.get("contact_probs")
+    if cp_raw is None:
+        return None
+    # [1, N, N] → [N, N]
+    return cp_raw.squeeze(0).detach().cpu()
+
+
+def _extract_has_clash(confidence: dict | None) -> bool | None:
+    """Extract OF3 clash detection flag."""
+    if confidence is None:
+        return None
+    hc = confidence.get("has_clash")
+    if hc is None:
+        return None
+    if isinstance(hc, torch.Tensor):
+        return bool(hc.item())
+    return bool(hc)
+
+
+def _compute_sample_consistency(
+    all_ca: torch.Tensor,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, float | None]:
+    """Compute inter-sample RMSD and per-residue RMSF across K samples.
+
+    Returns (sample_rmsd, sample_rmsf, consensus_score).
+    All None if K == 1.
+    """
+    k_actual = all_ca.shape[0]
+    if k_actual < 2:
+        return None, None, None
+
+    coords = all_ca.float()  # [K, N, 3]
+
+    # Pairwise RMSD
+    pairwise = []
+    for i in range(k_actual):
+        for j in range(i + 1, k_actual):
+            diff = coords[i] - coords[j]
+            rmsd_ij = float(diff.pow(2).sum(-1).mean().sqrt().item())
+            pairwise.append(rmsd_ij)
+    sample_rmsd = torch.tensor(pairwise)
+    mean_inter = sample_rmsd.mean().item()
+    consensus = 1.0 / (1.0 + mean_inter)
+
+    # Per-residue RMSF
+    mean_pos = coords.mean(dim=0)  # [N, 3]
+    deviations = coords - mean_pos.unsqueeze(0)  # [K, N, 3]
+    msf = deviations.pow(2).sum(dim=-1).mean(dim=0)  # [N]
+    sample_rmsf = msf.sqrt()
+
+    return sample_rmsd, sample_rmsf, consensus
+
+
 def _ensure_of3_importable() -> None:
     """Add openfold3-repo to sys.path if needed."""
     project_root = Path(__file__).resolve().parent.parent
@@ -211,80 +290,6 @@ def load_of3_diffusion(
 
     print(f"[OF3] Trunk cached: N_token={N_token}, C_z={C_z}")
     print(f"[OF3] Diffusion: {no_rollout_steps} steps, {K} samples")
-
-    # ── V2 confidence helpers ─────────────────────────────────────
-
-    def _extract_pae(
-        confidence: dict | None, best_idx: int = 0,
-    ) -> tuple[torch.Tensor | None, float | None]:
-        """Extract PAE matrix for best sample. Returns (pae, mean_pae)."""
-        if confidence is None:
-            return None, None
-        pae_raw = confidence.get("pae")
-        if pae_raw is None:
-            return None, None
-        # pae_raw: [1, K, N, N] or [1, N, N]
-        pae = pae_raw.squeeze(0)  # [K, N, N] or [N, N]
-        if pae.dim() == 3:
-            pae_best = pae[best_idx]  # [N, N]
-        else:
-            pae_best = pae  # [N, N]
-        mean_pae = float(pae_best.mean().item())
-        return pae_best.detach().cpu(), mean_pae
-
-    def _extract_contact_probs(confidence: dict | None) -> torch.Tensor | None:
-        """Extract OF3 distogram-derived contact probabilities."""
-        if confidence is None:
-            return None
-        cp_raw = confidence.get("contact_probs")
-        if cp_raw is None:
-            return None
-        # [1, N, N] → [N, N]
-        return cp_raw.squeeze(0).detach().cpu()
-
-    def _extract_has_clash(confidence: dict | None) -> bool | None:
-        """Extract OF3 clash detection flag."""
-        if confidence is None:
-            return None
-        hc = confidence.get("has_clash")
-        if hc is None:
-            return None
-        if isinstance(hc, torch.Tensor):
-            return bool(hc.item())
-        return bool(hc)
-
-    def _compute_sample_consistency(
-        all_ca: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, float | None]:
-        """Compute inter-sample RMSD and per-residue RMSF across K samples.
-
-        Returns (sample_rmsd, sample_rmsf, consensus_score).
-        All None if K == 1.
-        """
-        k_actual = all_ca.shape[0]
-        if k_actual < 2:
-            return None, None, None
-
-        coords = all_ca.float()  # [K, N, 3]
-
-        # Pairwise RMSD
-        pairwise = []
-        for i in range(k_actual):
-            for j in range(i + 1, k_actual):
-                diff = coords[i] - coords[j]
-                rmsd_ij = float(diff.pow(2).sum(-1).mean().sqrt().item())
-                pairwise.append(rmsd_ij)
-        sample_rmsd = torch.tensor(pairwise)
-        mean_inter = sample_rmsd.mean().item()
-        consensus = 1.0 / (1.0 + mean_inter)
-
-        # Per-residue RMSF
-        mean_pos = coords.mean(dim=0)  # [N, 3]
-        deviations = coords - mean_pos.unsqueeze(0)  # [K, N, 3]
-        msf = deviations.pow(2).sum(dim=-1).mean(dim=0)  # [N]
-        sample_rmsf = msf.sqrt()
-
-        return sample_rmsd, sample_rmsf, consensus
 
     # ── Build closure ───────────────────────────────────────────
     def _extract_ca_multi(atom_positions: torch.Tensor) -> torch.Tensor:

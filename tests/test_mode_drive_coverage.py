@@ -414,7 +414,9 @@ class TestManualCombo:
 class _FakeDiffResult:
     """Configurable diffusion result for fallback tests."""
 
-    def __init__(self, ca, ptm=0.1, plddt_mean=50.0):
+    def __init__(self, ca, ptm=0.1, plddt_mean=50.0,
+                 mean_pae=None, has_clash=None, consensus_score=None,
+                 contact_probs=None):
         n = ca.shape[0]
         self.best_ca = ca
         self.all_ca = ca.unsqueeze(0)
@@ -422,6 +424,14 @@ class _FakeDiffResult:
         self.plddt = torch.full((1, n), plddt_mean)
         self.ptm = torch.tensor([ptm])
         self.ranking = torch.tensor([0.8 * ptm + 0.2 * plddt_mean / 100.0])
+        # V2 fields
+        self.mean_pae = mean_pae
+        self.has_clash = has_clash
+        self.consensus_score = consensus_score
+        self.contact_probs = contact_probs
+        self.pae = None
+        self.sample_rmsd = None
+        self.sample_rmsf = None
 
 
 class TestFallbackLevels:
@@ -608,3 +618,399 @@ class TestFallbackReturnPaths:
         result = pipe.run(coords, zij, verbose=True)
         captured = capsys.readouterr()
         assert "Rejected" in captured.out
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Confidence V2 Tests
+# ═══════════════════════════════════════════════════════════════════
+
+def _dummy_step_result(**overrides):
+    """Minimal StepResult for _confidence_ok tests."""
+    n = 10
+    defaults = dict(
+        combo=ModeCombo(mode_indices=(0,), dfs=(0.5,), label="test"),
+        displaced_ca=torch.zeros(n, 3),
+        new_ca=torch.zeros(n, 3),
+        z_modified=torch.zeros(n, n, 128),
+        contact_map=torch.zeros(n, n),
+        rmsd=1.0,
+        eigenvalues=torch.zeros(5),
+        eigenvectors=torch.zeros(n, 5, 3),
+        b_factors=torch.zeros(n),
+        ptm=0.7,
+        plddt=torch.full((n,), 80.0),
+        ranking_score=0.6,
+    )
+    defaults.update(overrides)
+    return StepResult(**defaults)
+
+
+class TestConfidenceV2Warmup:
+    """Test warmup period with relaxed cutoffs."""
+
+    def test_warmup_uses_relaxed_ptm(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_ptm_cutoff = 0.5
+        pipe.config.confidence_warmup_steps = 3
+        pipe.config.confidence_warmup_ptm_cutoff = 0.3
+        # ptm=0.35 fails normal (0.5) but passes warmup (0.3)
+        r = _dummy_step_result(ptm=0.35)
+        assert pipe._confidence_ok(r, step_idx=0) is True   # in warmup
+        assert pipe._confidence_ok(r, step_idx=2) is True   # still in warmup
+        assert pipe._confidence_ok(r, step_idx=3) is False  # warmup over
+
+    def test_warmup_uses_relaxed_ranking(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_ranking_cutoff = 0.5
+        pipe.config.confidence_warmup_steps = 2
+        pipe.config.confidence_warmup_ranking_cutoff = 0.3
+        r = _dummy_step_result(ranking_score=0.35)
+        assert pipe._confidence_ok(r, step_idx=0) is True   # warmup
+        assert pipe._confidence_ok(r, step_idx=2) is False  # normal
+
+    def test_no_warmup_when_disabled(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_warmup_steps = 0
+        pipe.config.confidence_ptm_cutoff = 0.5
+        r = _dummy_step_result(ptm=0.35)
+        assert pipe._confidence_ok(r, step_idx=0) is False
+
+
+class TestConfidenceV2RgFilter:
+    """Test Rg ratio physical filter."""
+
+    def test_rg_too_high_rejects(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_rg_max = 2.5
+        pipe.config.confidence_rg_min = 0.3
+        r = _dummy_step_result(rg_ratio=3.0)
+        assert pipe._confidence_ok(r) is False
+
+    def test_rg_too_low_rejects(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_rg_max = 2.5
+        pipe.config.confidence_rg_min = 0.3
+        r = _dummy_step_result(rg_ratio=0.1)
+        assert pipe._confidence_ok(r) is False
+
+    def test_rg_in_range_passes(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_rg_max = 2.5
+        pipe.config.confidence_rg_min = 0.3
+        r = _dummy_step_result(rg_ratio=1.0)
+        assert pipe._confidence_ok(r) is True
+
+    def test_rg_none_skips_filter(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_rg_max = 2.5
+        pipe.config.confidence_rg_min = 0.3
+        r = _dummy_step_result(rg_ratio=None)
+        assert pipe._confidence_ok(r) is True
+
+
+class TestConfidenceV2ClashFilter:
+    """Test clash rejection filter."""
+
+    def test_clash_rejects_when_enabled(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_clash_reject = True
+        r = _dummy_step_result(has_clash=True)
+        assert pipe._confidence_ok(r) is False
+
+    def test_clash_passes_when_disabled(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_clash_reject = False
+        r = _dummy_step_result(has_clash=True)
+        assert pipe._confidence_ok(r) is True
+
+    def test_no_clash_passes(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_clash_reject = True
+        r = _dummy_step_result(has_clash=False)
+        assert pipe._confidence_ok(r) is True
+
+    def test_clash_none_passes(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_clash_reject = True
+        r = _dummy_step_result(has_clash=None)
+        assert pipe._confidence_ok(r) is True
+
+
+class TestConfidenceV2Metrics:
+    """Test V2 metric cutoffs (PAE, consensus, contact_recon, contact_of3)."""
+
+    def test_mean_pae_rejects_high(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_mean_pae_cutoff = 10.0
+        r = _dummy_step_result(mean_pae=15.0)
+        assert pipe._confidence_ok(r) is False
+
+    def test_mean_pae_passes_low(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_mean_pae_cutoff = 10.0
+        r = _dummy_step_result(mean_pae=5.0)
+        assert pipe._confidence_ok(r) is True
+
+    def test_mean_pae_none_cutoff_disables(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_mean_pae_cutoff = None
+        r = _dummy_step_result(mean_pae=999.0)
+        assert pipe._confidence_ok(r) is True
+
+    def test_consensus_rejects_low(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_consensus_cutoff = 0.5
+        r = _dummy_step_result(consensus_score=0.3)
+        assert pipe._confidence_ok(r) is False
+
+    def test_consensus_passes_high(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_consensus_cutoff = 0.5
+        r = _dummy_step_result(consensus_score=0.8)
+        assert pipe._confidence_ok(r) is True
+
+    def test_contact_recon_rejects_low(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_contact_recon_cutoff = 0.6
+        r = _dummy_step_result(contact_recon=0.4)
+        assert pipe._confidence_ok(r) is False
+
+    def test_contact_recon_passes_high(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_contact_recon_cutoff = 0.6
+        r = _dummy_step_result(contact_recon=0.8)
+        assert pipe._confidence_ok(r) is True
+
+    def test_contact_of3_rejects_low(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_contact_of3_cutoff = 0.5
+        r = _dummy_step_result(contact_of3=0.3)
+        assert pipe._confidence_ok(r) is False
+
+    def test_contact_of3_passes_high(self):
+        pipe = _make_pipeline()
+        pipe.config.confidence_contact_of3_cutoff = 0.5
+        r = _dummy_step_result(contact_of3=0.7)
+        assert pipe._confidence_ok(r) is True
+
+
+class TestConfidenceV2StallPrevention:
+    """Test stall prevention: max_consecutive_rejected + alpha_decay."""
+
+    def test_stall_stop_after_max_rejected(self, capsys):
+        pipe = _make_pipeline(n_steps=5)
+        pipe.config.enable_confidence_fallback = True
+        pipe.config.confidence_ptm_cutoff = 999.0  # always fail
+        pipe.config.max_consecutive_rejected = 2
+        pipe.config.fallback_extended_enabled = False
+        pipe.diffusion_fn = lambda z: _FakeDiffResult(
+            torch.randn(z.shape[0], 3), ptm=0.1
+        )
+        coords, zij = _random_inputs()
+        result = pipe.run(coords, zij, verbose=True)
+        # Should stop after 2 consecutive rejected
+        assert result.total_steps == 2
+        captured = capsys.readouterr()
+        assert "STOP" in captured.out
+
+    def test_alpha_decay_on_rejection(self):
+        pipe = _make_pipeline(n_steps=3, alpha=0.5)
+        pipe.config.enable_confidence_fallback = True
+        pipe.config.confidence_ptm_cutoff = 999.0
+        pipe.config.max_consecutive_rejected = 3
+        pipe.config.rejected_alpha_decay = 0.5
+        pipe.config.fallback_extended_enabled = False
+        pipe.diffusion_fn = lambda z: _FakeDiffResult(
+            torch.randn(z.shape[0], 3), ptm=0.1
+        )
+        coords, zij = _random_inputs()
+        result = pipe.run(coords, zij, verbose=False)
+        # After 3 rejected steps with 0.5 decay: 0.5 → 0.25 → 0.125
+        # Alpha should be restored after run
+        assert pipe.config.z_mixing_alpha == pytest.approx(0.5)
+
+    def test_alpha_restored_after_run(self):
+        pipe = _make_pipeline(n_steps=2, alpha=0.3)
+        pipe.config.enable_confidence_fallback = True
+        pipe.config.confidence_ptm_cutoff = 999.0
+        pipe.config.rejected_alpha_decay = 0.8
+        pipe.config.fallback_extended_enabled = False
+        pipe.diffusion_fn = lambda z: _FakeDiffResult(
+            torch.randn(z.shape[0], 3), ptm=0.1
+        )
+        coords, zij = _random_inputs()
+        pipe.run(coords, zij)
+        assert pipe.config.z_mixing_alpha == pytest.approx(0.3)
+
+    def test_consecutive_counter_resets_on_success(self):
+        pipe = _make_pipeline(n_steps=4, alpha=0.3)
+        pipe.config.enable_confidence_fallback = False  # no fallback, just run-level rejection
+        pipe.config.confidence_ptm_cutoff = 0.5
+        pipe.config.max_consecutive_rejected = 3
+
+        step_count = [0]
+        def _diff(z):
+            step_count[0] += 1
+            n = z.shape[0]
+            # Steps 1,2 fail (ptm<0.5), step 3 passes (ptm=0.8), step 4 fails
+            if step_count[0] == 3:
+                return _FakeDiffResult(torch.randn(n, 3), ptm=0.8)
+            return _FakeDiffResult(torch.randn(n, 3), ptm=0.1)
+
+        pipe.diffusion_fn = _diff
+        coords, zij = _random_inputs()
+        result = pipe.run(coords, zij)
+        # Should complete all 4 steps: 2 rejected, 1 success (resets counter), 1 rejected
+        assert result.total_steps == 4
+
+
+class TestConfidenceV2ContactRecon:
+    """Test contact_recon computation in _downstream_from_displaced."""
+
+    def test_contact_recon_computed_with_diffusion(self):
+        pipe = _make_pipeline(n_steps=1)
+        n = 15
+        ca = torch.randn(n, 3) * 10.0
+
+        def _diff_v2(z):
+            return _FakeDiffResult(
+                ca + torch.randn(n, 3) * 0.1,  # slightly displaced
+                ptm=0.8, mean_pae=5.0, has_clash=False,
+                consensus_score=0.9,
+            )
+
+        pipe.diffusion_fn = _diff_v2
+        coords, zij = _random_inputs(n=n)
+        result = pipe.step(coords, coords, zij, prev_rmsd=0.0)
+        # contact_recon should be computed (Pearson r)
+        assert result.contact_recon is not None
+        assert -1.0 <= result.contact_recon <= 1.0
+
+    def test_contact_of3_computed_with_probs(self):
+        pipe = _make_pipeline(n_steps=1)
+        n = 15
+        contact_p = torch.rand(n, n)
+        contact_p = 0.5 * (contact_p + contact_p.T)
+
+        def _diff_v2(z):
+            return _FakeDiffResult(
+                torch.randn(n, 3) * 10.0,
+                ptm=0.8, contact_probs=contact_p,
+                mean_pae=5.0, has_clash=False,
+            )
+
+        pipe.diffusion_fn = _diff_v2
+        coords, zij = _random_inputs(n=n)
+        result = pipe.step(coords, coords, zij, prev_rmsd=0.0)
+        assert result.contact_of3 is not None
+        assert -1.0 <= result.contact_of3 <= 1.0
+
+
+class TestConfidenceV2RgComputation:
+    """Test Rg ratio computation."""
+
+    def test_rg_ratio_always_computed(self):
+        """Rg ratio should be computed even without diffusion."""
+        pipe = _make_pipeline(n_steps=1)
+        coords, zij = _random_inputs()
+        result = pipe.step(coords, coords, zij, prev_rmsd=0.0)
+        assert result.rg_ratio is not None
+        assert result.rg_ratio > 0
+
+    def test_rg_ratio_scaled_protein(self):
+        """For realistic-scale coords, Rg ratio should be near 1.0."""
+        pipe = _make_pipeline(n_steps=1)
+        n = 50
+        torch.manual_seed(99)
+        # Create a chain-like structure with realistic Rg
+        coords = torch.zeros(n, 3)
+        for i in range(1, n):
+            coords[i] = coords[i-1] + torch.randn(3) * 3.8  # ~3.8A CA spacing
+        zij = torch.randn(n, n, 128)
+        result = pipe.step(coords, coords, zij, prev_rmsd=0.0)
+        # Rg_exp for N=50: 2.2 * 50^0.38 ≈ 9.7 Å
+        # Rg_obs for random walk: sqrt(n*3.8^2/6) ≈ 17 → ratio ~1.7
+        assert 0.3 < result.rg_ratio < 5.0
+
+
+class TestSampleConsistency:
+    """Test _compute_sample_consistency from of3_diffusion."""
+
+    def test_single_sample_returns_none(self):
+        from src.of3_diffusion import _compute_sample_consistency
+        all_ca = torch.randn(1, 20, 3)
+        rmsd, rmsf, cons = _compute_sample_consistency(all_ca)
+        assert rmsd is None
+        assert rmsf is None
+        assert cons is None
+
+    def test_identical_samples_perfect_consensus(self):
+        from src.of3_diffusion import _compute_sample_consistency
+        ca = torch.randn(1, 20, 3)
+        all_ca = ca.repeat(3, 1, 1)  # 3 identical samples
+        rmsd, rmsf, cons = _compute_sample_consistency(all_ca)
+        assert cons == pytest.approx(1.0, abs=1e-5)
+        assert rmsd is not None
+        assert float(rmsd.max()) < 1e-5
+        assert rmsf is not None
+        assert float(rmsf.max()) < 1e-5
+
+    def test_diverse_samples_low_consensus(self):
+        from src.of3_diffusion import _compute_sample_consistency
+        all_ca = torch.randn(5, 20, 3) * 10.0  # very diverse
+        rmsd, rmsf, cons = _compute_sample_consistency(all_ca)
+        assert cons is not None
+        assert cons < 0.5  # low consensus expected
+        assert rmsd.shape[0] == 10  # C(5,2) = 10 pairs
+        assert rmsf.shape[0] == 20  # per-residue
+
+
+class TestExtractHelpers:
+    """Test V2 helper functions in of3_diffusion."""
+
+    def test_extract_pae_none(self):
+        from src.of3_diffusion import _extract_pae
+        pae, mean = _extract_pae(None)
+        assert pae is None
+        assert mean is None
+
+    def test_extract_pae_missing_key(self):
+        from src.of3_diffusion import _extract_pae
+        pae, mean = _extract_pae({"other": 1.0})
+        assert pae is None
+
+    def test_extract_pae_3d(self):
+        from src.of3_diffusion import _extract_pae
+        raw = torch.rand(1, 3, 10, 10)  # [1, K=3, N, N]
+        pae, mean = _extract_pae({"pae": raw}, best_idx=1)
+        assert pae.shape == (10, 10)
+        assert mean == pytest.approx(float(raw[0, 1].mean()), abs=1e-4)
+
+    def test_extract_pae_2d(self):
+        from src.of3_diffusion import _extract_pae
+        raw = torch.rand(1, 10, 10)  # [1, N, N]
+        pae, mean = _extract_pae({"pae": raw})
+        assert pae.shape == (10, 10)
+
+    def test_extract_contact_probs_none(self):
+        from src.of3_diffusion import _extract_contact_probs
+        assert _extract_contact_probs(None) is None
+
+    def test_extract_contact_probs(self):
+        from src.of3_diffusion import _extract_contact_probs
+        cp = torch.rand(1, 10, 10)
+        result = _extract_contact_probs({"contact_probs": cp})
+        assert result.shape == (10, 10)
+
+    def test_extract_has_clash_none(self):
+        from src.of3_diffusion import _extract_has_clash
+        assert _extract_has_clash(None) is None
+
+    def test_extract_has_clash_tensor(self):
+        from src.of3_diffusion import _extract_has_clash
+        assert _extract_has_clash({"has_clash": torch.tensor(True)}) is True
+        assert _extract_has_clash({"has_clash": torch.tensor(False)}) is False
+
+    def test_extract_has_clash_bool(self):
+        from src.of3_diffusion import _extract_has_clash
+        assert _extract_has_clash({"has_clash": True}) is True
