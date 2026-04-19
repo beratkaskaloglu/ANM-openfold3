@@ -42,6 +42,7 @@ Anisotropic Network Model (ANM) tabanli protein dinamik analizi ile OpenFold3 ya
 
 ### Plans
 - [[IMPLEMENTATION_PLAN]] - Scale-up plan: 2000 PDB fine-tuning
+- [[plans/confidence_v2_implementation]] - Confidence V2: PAE, Rg filtresi, sample tutarlılığı, stall prevention
 
 ## Project Structure
 ```
