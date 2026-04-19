@@ -141,18 +141,35 @@ class StepResult:
     mean_pae: float | None = None           # ortalama PAE (düşük = iyi)
     has_clash: bool | None = None           # clash var mı
     consensus_score: float | None = None    # inter-sample uyum (yüksek = iyi)
-    contact_consistency: float | None = None  # ANM vs OF3 contact uyumu
+    contact_recon: float | None = None      # displaced vs new_ca contact Pearson r (pipeline iç tutarlılık)
+    contact_of3: float | None = None        # input contact vs OF3 distogram contact Pearson r
     rg_ratio: float | None = None           # Rg_obs / Rg_expected
 ```
 
 ### 3.2 _downstream_from_displaced() değişiklikleri
+
+İki ayrı contact consistency metriği hesaplanır:
+
+**A) `contact_recon`** — Pipeline iç tutarlılığı:
+- `input_contact = coords_to_contact(displaced)` (ANM/MD displaced coords → soft contact)
+- `output_contact = coords_to_contact(new_ca)` (OF3 diffusion çıktısı → soft contact)
+- Aynı `coords_to_contact()` fonksiyonu, aynı `r_cut` ve `tau` parametreleri
+- Eğer OF3 z_pseudo bilgisini iyi kullandıysa bunlar benzer olmalı
+- Yüksek = iyi (OF3 verilen contact'ı korumuş)
+
+**B) `contact_of3`** — OF3 distogram vs girdi contact:
+- `input_contact` = bizim contact (yukarıdaki gibi)
+- `of3_contact_probs` = OF3'ün kendi distogram head'inden ürettiği contact probs (8Å cutoff)
+- OF3'ün bizim contact bilgimizi ne kadar "dinlediğini" ölçer
+- Yüksek = iyi (OF3'ün kendi internal modeli de aynı contact'ları üretiyor)
 
 ```python
 # Mevcut diff_result çıkışına ek:
 mean_pae_out = None
 has_clash_out = None
 consensus_out = None
-contact_consistency_out = None
+contact_recon_out = None   # pipeline iç tutarlılık: displaced vs new_ca contact
+contact_of3_out = None     # OF3 distogram vs input contact
 rg_ratio_out = None
 
 if hasattr(diff_result, "mean_pae"):
@@ -160,14 +177,28 @@ if hasattr(diff_result, "mean_pae"):
     has_clash_out = diff_result.has_clash
     consensus_out = diff_result.consensus_score
 
-# Contact consistency: ANM-displaced vs OF3-predicted
-if diff_result.contact_probs is not None:
-    input_contact = contact  # coords_to_contact'tan geldi
-    pred_contact = diff_result.contact_probs
-    # Overlap: ne kadar örtüşüyor
-    mask = input_contact > 0.5
-    if mask.any():
-        contact_consistency_out = float(pred_contact[mask].mean().item())
+# A) Contact reconstruction: displaced → contact vs new_ca → contact
+#    (pipeline iç tutarlılığı — OF3 verilen contact bilgisini korudu mu?)
+output_contact = coords_to_contact(new_ca, cfg.contact_r_cut, cfg.contact_tau)
+input_contact = contact  # _downstream_from_displaced başında hesaplanan
+# Correlation: iki contact map arasındaki Pearson korelasyonu
+# (0-1 arası; 1.0 = birebir aynı, 0.0 = ilgisiz)
+flat_in = input_contact.flatten().float()
+flat_out = output_contact.flatten().float()
+if flat_in.std() > 1e-8 and flat_out.std() > 1e-8:
+    contact_recon_out = float(torch.corrcoef(torch.stack([flat_in, flat_out]))[0, 1].item())
+else:
+    contact_recon_out = 0.0
+
+# B) OF3 distogram contact probs vs input contact
+#    (OF3'ün kendi modeli de aynı contact'ları üretiyor mu?)
+if hasattr(diff_result, "contact_probs") and diff_result.contact_probs is not None:
+    of3_cp = diff_result.contact_probs  # [N, N]
+    flat_of3 = of3_cp.flatten().float()
+    if flat_of3.std() > 1e-8:
+        contact_of3_out = float(torch.corrcoef(torch.stack([flat_in, flat_of3]))[0, 1].item())
+    else:
+        contact_of3_out = 0.0
 
 # Rg ratio
 N = new_ca.shape[0]
@@ -185,7 +216,8 @@ confidence_consensus_cutoff: float | None = None      # min consensus score (Non
 confidence_rg_max: float = 2.5                        # max Rg ratio (>2.5 = yapı patlamış)
 confidence_rg_min: float = 0.3                        # min Rg ratio (<0.3 = aşırı sıkışmış)
 confidence_clash_reject: bool = True                  # has_clash=True → reject
-confidence_contact_consistency_cutoff: float | None = None  # min contact overlap
+confidence_contact_recon_cutoff: float | None = None   # min displaced-vs-new_ca contact Pearson r
+confidence_contact_of3_cutoff: float | None = None     # min input-vs-OF3-distogram contact Pearson r
 
 # Warmup: ilk N step'te cutoff'ları gevşet
 confidence_warmup_steps: int = 0                      # 0=disabled
@@ -234,8 +266,11 @@ def _confidence_ok(self, result: StepResult, step_idx: int = 0) -> bool:
     if cfg.confidence_consensus_cutoff is not None and result.consensus_score is not None:
         if result.consensus_score < cfg.confidence_consensus_cutoff:
             return False
-    if cfg.confidence_contact_consistency_cutoff is not None and result.contact_consistency is not None:
-        if result.contact_consistency < cfg.confidence_contact_consistency_cutoff:
+    if cfg.confidence_contact_recon_cutoff is not None and result.contact_recon is not None:
+        if result.contact_recon < cfg.confidence_contact_recon_cutoff:
+            return False
+    if cfg.confidence_contact_of3_cutoff is not None and result.contact_of3 is not None:
+        if result.contact_of3 < cfg.confidence_contact_of3_cutoff:
             return False
 
     return True
@@ -325,8 +360,12 @@ Yeni sütunlar:
 
 ```
 [FB L4] FAIL  a x0.25->0.25  pk=420 tk=44  pTM=0.342  pLDDT=85.9  rank=0.446
-              mPAE=12.3  Rg=1.8  contact_cons=0.62  RMSD_init=3.06A
+              mPAE=12.3  Rg=1.8  cRecon=0.72  cOF3=0.58  RMSD_init=3.06A
 ```
+
+Yeni sütunlar:
+- `cRecon` — contact reconstruction: displaced→contact vs new_ca→contact Pearson r
+- `cOF3` — OF3 distogram contact vs input contact Pearson r
 
 ---
 
@@ -384,6 +423,43 @@ configs = [
     {"num_diffusion_samples": 1},   # baseline
     {"num_diffusion_samples": 3, "confidence_consensus_cutoff": 0.3},
     {"num_diffusion_samples": 3, "confidence_consensus_cutoff": 0.5},
+]
+```
+
+### Deney 7: Contact reconstruction cutoff
+```python
+configs = [
+    {"confidence_contact_recon_cutoff": None},   # disabled (baseline)
+    {"confidence_contact_recon_cutoff": 0.3},     # gevşek
+    {"confidence_contact_recon_cutoff": 0.5},     # orta
+    {"confidence_contact_recon_cutoff": 0.7},     # sıkı
+]
+# contact_recon = Pearson r(contact(displaced), contact(new_ca))
+# Düşük = OF3 verilen contact bilgisini kullanmamış, yapı farklı
+```
+
+### Deney 8: OF3 distogram contact cutoff (Faz 1 sonrası)
+```python
+configs = [
+    {"confidence_contact_of3_cutoff": None},     # disabled (baseline)
+    {"confidence_contact_of3_cutoff": 0.3},
+    {"confidence_contact_of3_cutoff": 0.5},
+]
+# contact_of3 = Pearson r(contact(displaced), of3_contact_probs)
+# OF3'ün kendi iç modeli de aynı contact'ları üretiyor mu
+```
+
+### Deney 9: Kombine filtreler (en iyi tekli sonuçlardan)
+```python
+# Deney 1-8'in en iyi sonuçlarını birleştir
+configs = [
+    {
+        "confidence_warmup_steps": 5,
+        "confidence_rg_max": 2.5,
+        "max_consecutive_rejected": 3,
+        "confidence_contact_recon_cutoff": 0.5,
+    },
+    # ... en iyi kombinasyonlar
 ]
 ```
 
