@@ -1,7 +1,7 @@
 # Confidence V2: Genişletilmiş Metrik Entegrasyonu
 
 *Tarih: 2026-04-19*
-*Durum: PLAN — henüz implementasyon yok*
+*Durum: DONE — Faz 1-5 tamamlandı (2026-04-19)*
 
 ## Motivasyon
 
@@ -493,3 +493,75 @@ configs = [
 - AF3 summary_confidences JSON yapısı — pae, contact_probs, has_clash, ranking_score
 - Thacker (2026) — pLDDT FalseVerify oranı
 - Oda et al. (2024) — İteratif refinement'ta yanıltıcı confidence
+
+---
+
+## Implementation Summary (2026-04-19)
+
+### Commit geçmişi
+
+| Commit | Açıklama |
+|--------|----------|
+| `2c11426` | feat: Confidence V2 — PAE, Rg filter, contact consistency, warmup, stall prevention |
+| `2ce2fe7` | test: 40 yeni V2 test + helper'ları module-level'a taşı |
+| `b55f26e` | feat: verbose reject reason + grid search scripti |
+
+### Yapılan değişiklikler
+
+**`src/of3_diffusion.py`**
+- DiffusionResult: 7 yeni V2 alan (pae, contact_probs, has_clash, mean_pae, sample_rmsd, sample_rmsf, consensus_score)
+- 4 helper fonksiyon module-level'a taşındı: `_extract_pae`, `_extract_contact_probs`, `_extract_has_clash`, `_compute_sample_consistency`
+- K==1 ve K>1 path'leri V2 extractors ile güncellendi
+
+**`src/mode_drive_config.py`**
+- 17 yeni config alanı: Rg bounds, clash reject, warmup, stall prevention, V2 cutoff'lar
+- StepResult: 6 yeni diagnostik alan (mean_pae, has_clash, consensus_score, contact_recon, contact_of3, rg_ratio)
+
+**`src/mode_drive.py`**
+- `_confidence_check()`: reason döndüren yeni versiyon
+- `_confidence_ok()`: wrapper (geriye uyumlu)
+- `_downstream_from_displaced()`: contact_recon, contact_of3, rg_ratio hesaplama
+- Warmup: ilk N step'te gevşetilmiş ptm/ranking cutoff
+- Physical filters: Rg range + clash rejection (her zaman aktif)
+- Stall prevention: max_consecutive_rejected + rejected_alpha_decay
+- Alpha restore: run() sonunda orijinal alpha'ya dön
+- Verbose: her rejected step'te `[neden]` gösterimi
+
+**`scripts/grid_search_v2.py`**
+- 8 deney (warmup, Rg, max_rejected, alpha_decay, PAE, consensus, contact_recon, contact_of3)
+- Mock mode (lokal) + OF3 mode (Colab)
+- JSON çıktı + summary tablo
+
+**`tests/test_mode_drive_coverage.py`**
+- 40 yeni test (toplam 360): warmup, Rg, clash, PAE, consensus, contact_recon, contact_of3, stall, alpha restore, sample consistency, extract helpers
+
+### Önerilen baseline cutoff'lar (Colab'da test edilecek)
+
+```python
+# V1 — gevşetildi (artık ana gate değil)
+confidence_ptm_cutoff = 0.3          # 0.5 → 0.3
+confidence_ranking_cutoff = 0.4      # 0.5 → 0.4
+confidence_plddt_cutoff = 70.0       # değişmedi
+
+# V2 — ana gate olarak
+confidence_mean_pae_cutoff = 15.0    # max mean PAE (Å)
+confidence_clash_reject = True       # has_clash → reject
+confidence_rg_max = 2.5              # yapı patlamış
+confidence_rg_min = 0.3              # aşırı sıkışmış
+
+# Warmup
+confidence_warmup_steps = 5
+confidence_warmup_ptm_cutoff = 0.25
+confidence_warmup_ranking_cutoff = 0.3
+
+# Stall prevention
+max_consecutive_rejected = 5
+rejected_alpha_decay = 0.85
+```
+
+### Sonraki adımlar
+
+1. **Colab'da gerçek protein ile test** — notebook'ta V2 metrikleri gözlemle
+2. **Grid search** — `python -m scripts.grid_search_v2 --query ... --n-steps 15`
+3. **Deney 9: kombine** — en iyi tekli sonuçlardan kombine config oluştur
+4. **mean_pae'yi ana gate yap** — pTM/ranking yerine (daha hassas, daha az bilgi kaybı)
