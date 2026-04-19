@@ -534,9 +534,10 @@ class ModeDrivePipeline:
 
         return best_overall
 
-    def _confidence_ok(self, result: StepResult, step_idx: int = 0) -> bool:
+    def _confidence_check(self, result: StepResult, step_idx: int = 0) -> tuple[bool, str]:
         """Check if step result passes ALL confidence cutoffs (AND logic).
 
+        Returns (ok, reason). reason is "" if ok, otherwise the first failing check.
         Supports warmup period with relaxed cutoffs and V2 physical filters.
         """
         cfg = self.config
@@ -546,7 +547,7 @@ class ModeDrivePipeline:
             and result.plddt is None
             and result.ranking_score is None
         ):
-            return True
+            return True, ""
 
         # Step-adaptive cutoffs (warmup)
         in_warmup = cfg.confidence_warmup_steps > 0 and step_idx < cfg.confidence_warmup_steps
@@ -555,40 +556,47 @@ class ModeDrivePipeline:
 
         # Physical filters (always active)
         if result.rg_ratio is not None:
-            if result.rg_ratio > cfg.confidence_rg_max or result.rg_ratio < cfg.confidence_rg_min:
-                return False
+            if result.rg_ratio > cfg.confidence_rg_max:
+                return False, f"Rg={result.rg_ratio:.2f}>{cfg.confidence_rg_max}"
+            if result.rg_ratio < cfg.confidence_rg_min:
+                return False, f"Rg={result.rg_ratio:.2f}<{cfg.confidence_rg_min}"
 
         if cfg.confidence_clash_reject and result.has_clash:
-            return False
+            return False, "clash"
 
         # Core metrics (warmup-adjusted)
         if result.ptm is not None and result.ptm < ptm_cut:
-            return False
+            return False, f"pTM={result.ptm:.3f}<{ptm_cut}"
         if result.plddt is not None:
             mean_plddt = result.plddt.mean().item()
             if mean_plddt < cfg.confidence_plddt_cutoff:
-                return False
+                return False, f"pLDDT={mean_plddt:.1f}<{cfg.confidence_plddt_cutoff}"
         if (
             result.ranking_score is not None
             and result.ranking_score < rank_cut
         ):
-            return False
+            return False, f"rank={result.ranking_score:.3f}<{rank_cut}"
 
         # V2 metrics (None cutoff = disabled)
         if cfg.confidence_mean_pae_cutoff is not None and result.mean_pae is not None:
             if result.mean_pae > cfg.confidence_mean_pae_cutoff:
-                return False
+                return False, f"mPAE={result.mean_pae:.1f}>{cfg.confidence_mean_pae_cutoff}"
         if cfg.confidence_consensus_cutoff is not None and result.consensus_score is not None:
             if result.consensus_score < cfg.confidence_consensus_cutoff:
-                return False
+                return False, f"cons={result.consensus_score:.3f}<{cfg.confidence_consensus_cutoff}"
         if cfg.confidence_contact_recon_cutoff is not None and result.contact_recon is not None:
             if result.contact_recon < cfg.confidence_contact_recon_cutoff:
-                return False
+                return False, f"cR={result.contact_recon:.3f}<{cfg.confidence_contact_recon_cutoff}"
         if cfg.confidence_contact_of3_cutoff is not None and result.contact_of3 is not None:
             if result.contact_of3 < cfg.confidence_contact_of3_cutoff:
-                return False
+                return False, f"cOF3={result.contact_of3:.3f}<{cfg.confidence_contact_of3_cutoff}"
 
-        return True
+        return True, ""
+
+    def _confidence_ok(self, result: StepResult, step_idx: int = 0) -> bool:
+        """Check if step result passes ALL confidence cutoffs (AND logic)."""
+        ok, _ = self._confidence_check(result, step_idx)
+        return ok
 
     @torch.no_grad()
     def step_with_fallback(
@@ -871,7 +879,11 @@ class ModeDrivePipeline:
                 ai = result.autostop_info or {}
                 pk = ai.get("picked_step_md", "-")
                 tk = ai.get("turn_k", "-")
-                tag = "PASS" if ok else "FAIL"
+                if not ok:
+                    _, rej_reason = self._confidence_check(result, step_idx=step_idx)
+                    tag = f"FAIL[{rej_reason}]" if rej_reason else "FAIL"
+                else:
+                    tag = "PASS"
                 tgt_str = ""
                 if target_coords is not None and result.new_ca is not None:
                     rmsd_t = compute_rmsd(result.new_ca, target_coords)
@@ -1304,6 +1316,11 @@ class ModeDrivePipeline:
                     v2_parts.append(f"mPAE={step_result.mean_pae:.0f}")
                 if v2_parts:
                     line += "  " + " ".join(v2_parts)
+                # Show reject reason
+                if step_result.rejected:
+                    _, reason = self._confidence_check(step_result, step_idx=step_idx)
+                    if reason:
+                        line += f"  [{reason}]"
                 print(line)
 
             # Update for next step only if not rejected.
