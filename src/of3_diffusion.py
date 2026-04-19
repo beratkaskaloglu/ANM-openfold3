@@ -44,6 +44,15 @@ class DiffusionResult:
     ptm: torch.Tensor | None      # [K] per-sample pTM (0-1)
     ranking: torch.Tensor | None  # [K] per-sample ranking score
 
+    # Confidence V2
+    pae: torch.Tensor | None = None           # [N, N] best sample PAE matrix
+    contact_probs: torch.Tensor | None = None  # [N, N] OF3 distogram contact probs
+    has_clash: bool | None = None              # OF3 clash detection
+    mean_pae: float | None = None              # mean PAE of best sample
+    sample_rmsd: torch.Tensor | None = None    # [K*(K-1)/2] pairwise inter-sample RMSD
+    sample_rmsf: torch.Tensor | None = None    # [N] per-residue RMSF across K samples
+    consensus_score: float | None = None       # 1/(1 + mean_inter_sample_rmsd)
+
 
 def _ensure_of3_importable() -> None:
     """Add openfold3-repo to sys.path if needed."""
@@ -203,6 +212,80 @@ def load_of3_diffusion(
     print(f"[OF3] Trunk cached: N_token={N_token}, C_z={C_z}")
     print(f"[OF3] Diffusion: {no_rollout_steps} steps, {K} samples")
 
+    # ── V2 confidence helpers ─────────────────────────────────────
+
+    def _extract_pae(
+        confidence: dict | None, best_idx: int = 0,
+    ) -> tuple[torch.Tensor | None, float | None]:
+        """Extract PAE matrix for best sample. Returns (pae, mean_pae)."""
+        if confidence is None:
+            return None, None
+        pae_raw = confidence.get("pae")
+        if pae_raw is None:
+            return None, None
+        # pae_raw: [1, K, N, N] or [1, N, N]
+        pae = pae_raw.squeeze(0)  # [K, N, N] or [N, N]
+        if pae.dim() == 3:
+            pae_best = pae[best_idx]  # [N, N]
+        else:
+            pae_best = pae  # [N, N]
+        mean_pae = float(pae_best.mean().item())
+        return pae_best.detach().cpu(), mean_pae
+
+    def _extract_contact_probs(confidence: dict | None) -> torch.Tensor | None:
+        """Extract OF3 distogram-derived contact probabilities."""
+        if confidence is None:
+            return None
+        cp_raw = confidence.get("contact_probs")
+        if cp_raw is None:
+            return None
+        # [1, N, N] → [N, N]
+        return cp_raw.squeeze(0).detach().cpu()
+
+    def _extract_has_clash(confidence: dict | None) -> bool | None:
+        """Extract OF3 clash detection flag."""
+        if confidence is None:
+            return None
+        hc = confidence.get("has_clash")
+        if hc is None:
+            return None
+        if isinstance(hc, torch.Tensor):
+            return bool(hc.item())
+        return bool(hc)
+
+    def _compute_sample_consistency(
+        all_ca: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, float | None]:
+        """Compute inter-sample RMSD and per-residue RMSF across K samples.
+
+        Returns (sample_rmsd, sample_rmsf, consensus_score).
+        All None if K == 1.
+        """
+        k_actual = all_ca.shape[0]
+        if k_actual < 2:
+            return None, None, None
+
+        coords = all_ca.float()  # [K, N, 3]
+
+        # Pairwise RMSD
+        pairwise = []
+        for i in range(k_actual):
+            for j in range(i + 1, k_actual):
+                diff = coords[i] - coords[j]
+                rmsd_ij = float(diff.pow(2).sum(-1).mean().sqrt().item())
+                pairwise.append(rmsd_ij)
+        sample_rmsd = torch.tensor(pairwise)
+        mean_inter = sample_rmsd.mean().item()
+        consensus = 1.0 / (1.0 + mean_inter)
+
+        # Per-residue RMSF
+        mean_pos = coords.mean(dim=0)  # [N, 3]
+        deviations = coords - mean_pos.unsqueeze(0)  # [K, N, 3]
+        msf = deviations.pow(2).sum(dim=-1).mean(dim=0)  # [N]
+        sample_rmsf = msf.sqrt()
+
+        return sample_rmsd, sample_rmsf, consensus
+
     # ── Build closure ───────────────────────────────────────────
     def _extract_ca_multi(atom_positions: torch.Tensor) -> torch.Tensor:
         """Extract CA coordinates from all-atom positions for K samples.
@@ -318,6 +401,11 @@ def load_of3_diffusion(
                     plddt_f = plddt.mean().item() / 100.0 if plddt is not None else 0.0
                     ranking_val = 0.8 * ptm_f + 0.2 * plddt_f
 
+                # V2: extract PAE, contact_probs, has_clash
+                pae_out, mean_pae_out = _extract_pae(confidence, best_idx=0)
+                cp_out = _extract_contact_probs(confidence)
+                clash_out = _extract_has_clash(confidence)
+
                 return DiffusionResult(
                     all_ca=all_ca.to(z_mod.device),
                     best_ca=ca,
@@ -325,6 +413,10 @@ def load_of3_diffusion(
                     plddt=plddt.unsqueeze(0) if plddt is not None else None,
                     ptm=torch.tensor([ptm_f]) if ptm is not None else None,
                     ranking=torch.tensor([ranking_val]),
+                    pae=pae_out,
+                    contact_probs=cp_out,
+                    has_clash=clash_out,
+                    mean_pae=mean_pae_out,
                 )
             else:
                 # No confidence available → still return DiffusionResult for consistency
@@ -379,6 +471,14 @@ def load_of3_diffusion(
 
         best_ca = all_ca[best_idx].to(z_mod.device)
 
+        # V2: extract PAE, contact_probs, has_clash
+        pae_out, mean_pae_out = _extract_pae(confidence, best_idx=best_idx)
+        cp_out = _extract_contact_probs(confidence)
+        clash_out = _extract_has_clash(confidence)
+
+        # V2: inter-sample consistency (K>1)
+        s_rmsd, s_rmsf, consensus = _compute_sample_consistency(all_ca)
+
         return DiffusionResult(
             all_ca=all_ca.to(z_mod.device),
             best_ca=best_ca,
@@ -386,6 +486,13 @@ def load_of3_diffusion(
             plddt=plddt,
             ptm=ptm,
             ranking=ranking,
+            pae=pae_out,
+            contact_probs=cp_out,
+            has_clash=clash_out,
+            mean_pae=mean_pae_out,
+            sample_rmsd=s_rmsd,
+            sample_rmsf=s_rmsf,
+            consensus_score=consensus,
         )
 
     # Return zij_trunk without batch/sample dims: [N_token, N_token, C_z]

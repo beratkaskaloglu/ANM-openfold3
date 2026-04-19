@@ -64,6 +64,24 @@ class ModeDriveConfig:
     confidence_plddt_cutoff: float = 70.0        # minimum mean pLDDT to accept (0-100 scale, OF3 native)
     confidence_ranking_cutoff: float = 0.5       # minimum ranking score to accept
 
+    # Confidence V2 — additional metrics (None = disabled)
+    confidence_mean_pae_cutoff: float | None = None       # max mean PAE to accept
+    confidence_consensus_cutoff: float | None = None      # min consensus score (K>1)
+    confidence_contact_recon_cutoff: float | None = None   # min Pearson r(contact_in, contact_out)
+    confidence_contact_of3_cutoff: float | None = None     # min Pearson r(contact_in, of3_distogram)
+    confidence_rg_max: float = 2.5                        # max Rg ratio (>2.5 = yapı patlamış)
+    confidence_rg_min: float = 0.3                        # min Rg ratio (<0.3 = aşırı sıkışmış)
+    confidence_clash_reject: bool = True                  # has_clash=True → reject
+
+    # Warmup: ilk N step'te cutoff'ları gevşet
+    confidence_warmup_steps: int = 0                      # 0=disabled
+    confidence_warmup_ptm_cutoff: float = 0.35            # warmup sırasında pTM cutoff
+    confidence_warmup_ranking_cutoff: float = 0.40        # warmup sırasında ranking cutoff
+
+    # Stall prevention
+    max_consecutive_rejected: int = 0                     # 0=unlimited, >0 = stop after N consecutive rejected
+    rejected_alpha_decay: float = 1.0                     # multiply alpha by this after each rejected step (1.0=no decay)
+
     # Adaptive fallback
     enable_confidence_fallback: bool = False      # enable confidence-guided fallback
     fallback_combo_tries: int = 3                # Level 1: try next N combos by collectivity
@@ -159,6 +177,14 @@ class StepResult:
     fallback_level: int = 0                   # 0=normal, 1-8=fallback level, 9=forced-accept
     rejected: bool = False                    # True if all fallback levels failed (forced-accept)
     num_samples: int = 1                      # K diffusion samples used
+
+    # Confidence V2
+    mean_pae: float | None = None             # mean PAE of best sample (lower = better)
+    has_clash: bool | None = None             # OF3 clash detection
+    consensus_score: float | None = None      # inter-sample agreement (higher = better, K>1)
+    contact_recon: float | None = None        # Pearson r: contact(displaced) vs contact(new_ca)
+    contact_of3: float | None = None          # Pearson r: contact(displaced) vs OF3 distogram
+    rg_ratio: float | None = None             # Rg_observed / Rg_expected
 
     # Autostop strategy diagnostics (None when strategy != "autostop")
     autostop_info: dict | None = None

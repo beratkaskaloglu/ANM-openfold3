@@ -43,6 +43,7 @@ def _make_pipeline(strategy="collectivity", alpha=0.3, n_steps=2, **kw):
         n_combinations=5,
         max_combo_size=2,
         df=0.6, df_min=0.3, df_max=1.5,
+        confidence_rg_min=0.0, confidence_rg_max=100.0,  # disable Rg filter for unit tests
         **kw,
     )
     return ModeDrivePipeline(converter=MockConverter(), config=cfg)
@@ -536,6 +537,7 @@ class TestFallbackReturnPaths:
             n_combinations=1,
             max_combo_size=2,
             df=0.6, df_min=0.3, df_max=0.6,  # no escalation
+            confidence_rg_min=0.0, confidence_rg_max=100.0,  # disable Rg for tests
             enable_confidence_fallback=True,
             confidence_ptm_cutoff=0.5,
             confidence_plddt_cutoff=10.0,

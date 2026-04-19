@@ -275,6 +275,43 @@ class ModeDrivePipeline:
         # Score: RMSD from INITIAL structure (higher = more exploration)
         rmsd = compute_rmsd(initial_coords_ca, new_ca)
 
+        # ── Confidence V2 metrics ──
+        mean_pae_out = None
+        has_clash_out = None
+        consensus_out = None
+        contact_recon_out = None
+        contact_of3_out = None
+        rg_ratio_out = None
+
+        if self.diffusion_fn is not None and hasattr(diff_result, "mean_pae"):
+            mean_pae_out = diff_result.mean_pae
+            has_clash_out = diff_result.has_clash
+            consensus_out = diff_result.consensus_score
+
+            # Contact reconstruction: displaced→contact vs new_ca→contact
+            output_contact = coords_to_contact(new_ca, cfg.contact_r_cut, cfg.contact_tau)
+            flat_in = contact.flatten().float()
+            flat_out = output_contact.flatten().float()
+            if flat_in.std() > 1e-8 and flat_out.std() > 1e-8:
+                contact_recon_out = float(
+                    torch.corrcoef(torch.stack([flat_in, flat_out]))[0, 1].item()
+                )
+
+            # OF3 distogram contact vs input contact
+            if diff_result.contact_probs is not None:
+                flat_of3 = diff_result.contact_probs.flatten().float()
+                if flat_of3.std() > 1e-8 and flat_in.std() > 1e-8:
+                    contact_of3_out = float(
+                        torch.corrcoef(torch.stack([flat_in, flat_of3]))[0, 1].item()
+                    )
+
+        # Rg ratio (always computable)
+        N = new_ca.shape[0]
+        centered = new_ca.float() - new_ca.float().mean(0)
+        rg_obs = float(centered.pow(2).sum(1).mean().sqrt().item())
+        rg_exp = 2.2 * (N ** 0.38)
+        rg_ratio_out = rg_obs / max(rg_exp, 1e-6)
+
         return StepResult(
             combo=combo,
             displaced_ca=displaced,
@@ -294,6 +331,12 @@ class ModeDrivePipeline:
             all_ranking=all_ranking_out,
             num_samples=num_samples_out,
             autostop_info=autostop_info,
+            mean_pae=mean_pae_out,
+            has_clash=has_clash_out,
+            consensus_score=consensus_out,
+            contact_recon=contact_recon_out,
+            contact_of3=contact_of3_out,
+            rg_ratio=rg_ratio_out,
         )
 
     # ─────────────── Autostop strategy ───────────────
@@ -491,8 +534,11 @@ class ModeDrivePipeline:
 
         return best_overall
 
-    def _confidence_ok(self, result: StepResult) -> bool:
-        """Check if step result passes ALL confidence cutoffs (AND logic)."""
+    def _confidence_ok(self, result: StepResult, step_idx: int = 0) -> bool:
+        """Check if step result passes ALL confidence cutoffs (AND logic).
+
+        Supports warmup period with relaxed cutoffs and V2 physical filters.
+        """
         cfg = self.config
 
         if (
@@ -502,7 +548,21 @@ class ModeDrivePipeline:
         ):
             return True
 
-        if result.ptm is not None and result.ptm < cfg.confidence_ptm_cutoff:
+        # Step-adaptive cutoffs (warmup)
+        in_warmup = cfg.confidence_warmup_steps > 0 and step_idx < cfg.confidence_warmup_steps
+        ptm_cut = cfg.confidence_warmup_ptm_cutoff if in_warmup else cfg.confidence_ptm_cutoff
+        rank_cut = cfg.confidence_warmup_ranking_cutoff if in_warmup else cfg.confidence_ranking_cutoff
+
+        # Physical filters (always active)
+        if result.rg_ratio is not None:
+            if result.rg_ratio > cfg.confidence_rg_max or result.rg_ratio < cfg.confidence_rg_min:
+                return False
+
+        if cfg.confidence_clash_reject and result.has_clash:
+            return False
+
+        # Core metrics (warmup-adjusted)
+        if result.ptm is not None and result.ptm < ptm_cut:
             return False
         if result.plddt is not None:
             mean_plddt = result.plddt.mean().item()
@@ -510,9 +570,24 @@ class ModeDrivePipeline:
                 return False
         if (
             result.ranking_score is not None
-            and result.ranking_score < cfg.confidence_ranking_cutoff
+            and result.ranking_score < rank_cut
         ):
             return False
+
+        # V2 metrics (None cutoff = disabled)
+        if cfg.confidence_mean_pae_cutoff is not None and result.mean_pae is not None:
+            if result.mean_pae > cfg.confidence_mean_pae_cutoff:
+                return False
+        if cfg.confidence_consensus_cutoff is not None and result.consensus_score is not None:
+            if result.consensus_score < cfg.confidence_consensus_cutoff:
+                return False
+        if cfg.confidence_contact_recon_cutoff is not None and result.contact_recon is not None:
+            if result.contact_recon < cfg.confidence_contact_recon_cutoff:
+                return False
+        if cfg.confidence_contact_of3_cutoff is not None and result.contact_of3 is not None:
+            if result.contact_of3 < cfg.confidence_contact_of3_cutoff:
+                return False
+
         return True
 
     @torch.no_grad()
@@ -762,11 +837,21 @@ class ModeDrivePipeline:
             desc: str = "",
         ) -> bool:
             nonlocal best_result, best_ranking
+
+            # L9 Rg guard: reject physically nonsensical structures from candidate pool
+            if result.rg_ratio is not None and result.rg_ratio > cfg.confidence_rg_max:
+                if cfg.autostop_verbose:
+                    print(
+                        f"      [FB L{level}] SKIP  Rg={result.rg_ratio:.1f} "
+                        f"> {cfg.confidence_rg_max} — {desc}"
+                    )
+                return False
+
             r_score = result.ranking_score if result.ranking_score is not None else 0.0
             if r_score > best_ranking:
                 best_ranking = r_score
                 best_result = result
-            ok = self._confidence_ok(result)
+            ok = self._confidence_ok(result, step_idx=step_idx)
             if cfg.autostop_verbose:
                 ptm_str = (
                     f"{result.ptm:.3f}" if result.ptm is not None else "  -  "
@@ -792,11 +877,23 @@ class ModeDrivePipeline:
                     rmsd_t = compute_rmsd(result.new_ca, target_coords)
                     tm_t = tm_score(result.new_ca, target_coords)
                     tgt_str = f"  RMSD_tgt={rmsd_t:.2f}A  TM_tgt={tm_t:.3f}"
+                # V2 metrics
+                v2_str = ""
+                if result.rg_ratio is not None:
+                    v2_str += f"  Rg={result.rg_ratio:.2f}"
+                if result.contact_recon is not None:
+                    v2_str += f"  cR={result.contact_recon:.2f}"
+                if result.contact_of3 is not None:
+                    v2_str += f"  cOF3={result.contact_of3:.2f}"
+                if result.mean_pae is not None:
+                    v2_str += f"  mPAE={result.mean_pae:.1f}"
+                if result.consensus_score is not None:
+                    v2_str += f"  cons={result.consensus_score:.2f}"
                 print(
                     f"      [FB L{level}] {tag}  {desc:<24s}  "
                     f"pk={pk!s:>5} tk={tk!s:>3}  "
                     f"pTM={ptm_str}  pLDDT={plddt_str}  rank={rank_str}  "
-                    f"RMSD_init={result.rmsd:.2f}A{tgt_str}"
+                    f"RMSD_init={result.rmsd:.2f}A{v2_str}{tgt_str}"
                 )
             return ok
 
@@ -1124,6 +1221,8 @@ class ModeDrivePipeline:
         coords_ca = initial_coords_ca
         z_current = zij_trunk
         prev_rmsd = 0.0
+        consecutive_rejected = 0
+        orig_alpha = cfg.z_mixing_alpha
 
         use_fallback = cfg.enable_confidence_fallback
 
@@ -1195,6 +1294,16 @@ class ModeDrivePipeline:
                     tm_t = tm_score(step_result.new_ca, target_coords)
                     line += f" {rmsd_t:>10.3f} {tm_t:>8.4f}"
                 line += f" {ptm_str:>6} {plddt_str:>6} {fb_str:>3}"
+                # V2 compact summary
+                v2_parts = []
+                if step_result.rg_ratio is not None:
+                    v2_parts.append(f"Rg={step_result.rg_ratio:.1f}")
+                if step_result.contact_recon is not None:
+                    v2_parts.append(f"cR={step_result.contact_recon:.2f}")
+                if step_result.mean_pae is not None:
+                    v2_parts.append(f"mPAE={step_result.mean_pae:.0f}")
+                if v2_parts:
+                    line += "  " + " ".join(v2_parts)
                 print(line)
 
             # Update for next step only if not rejected.
@@ -1202,6 +1311,24 @@ class ModeDrivePipeline:
                 prev_rmsd = step_result.rmsd
                 coords_ca = step_result.new_ca
                 z_current = step_result.z_modified
+                consecutive_rejected = 0
+                cfg.z_mixing_alpha = orig_alpha  # restore on success
+            else:
+                consecutive_rejected += 1
+                # Alpha decay on rejection (stall prevention)
+                if cfg.rejected_alpha_decay < 1.0:
+                    cfg.z_mixing_alpha = max(0.02, cfg.z_mixing_alpha * cfg.rejected_alpha_decay)
+                # Max consecutive rejected check
+                if cfg.max_consecutive_rejected > 0 and consecutive_rejected >= cfg.max_consecutive_rejected:
+                    if verbose:
+                        print(
+                            f"  STOP: {consecutive_rejected} consecutive rejected steps "
+                            f"— pipeline stalled"
+                        )
+                    break
+
+        # Restore alpha to original after loop (in case alpha_decay was applied)
+        cfg.z_mixing_alpha = orig_alpha
 
         if verbose and result.step_results:
             print(f"{'-'*len(header)}")
