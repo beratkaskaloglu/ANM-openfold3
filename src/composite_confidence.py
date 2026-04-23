@@ -66,10 +66,17 @@ def normalize_pae(mean_pae: float | None) -> float:
 
 
 def normalize_rg(rg_ratio: float | None) -> float:
-    """Rg ratio -> normalized. 1.0=ideal, penalty grows with deviation."""
+    """Rg ratio -> normalized. 1.0=ideal, quadratic penalty for deviation.
+
+    Quadratic penalty makes Rg>1.5 drop very fast:
+      Rg=1.0 -> 1.00, Rg=1.2 -> 0.96, Rg=1.5 -> 0.75
+      Rg=1.8 -> 0.36, Rg=2.0 -> 0.00, Rg=2.5 -> 0.00
+    """
     if rg_ratio is None:
         return 0.5
-    return 1.0 - _clamp(abs(rg_ratio - 1.0) / 1.5)
+    dev = abs(rg_ratio - 1.0)
+    # Quadratic: (dev/1.0)^2 — hits zero at deviation=1.0 (i.e. Rg=2.0)
+    return _clamp(1.0 - (dev / 1.0) ** 2)
 
 
 def normalize_contact_recon(cr: float | None) -> float:
@@ -143,11 +150,13 @@ def composite_score_from_step(step_result, weights: CompositeWeights | None = No
 
 
 # Preset weight sets for grid search
+# Rg weight raised across all presets after V3.0 showed Rg=2.3 structures
+# being accepted then cascading into full divergence.
 WEIGHT_PRESETS: dict[str, CompositeWeights] = {
-    "A_ptm_heavy": CompositeWeights(w_ptm=0.40, w_plddt=0.20, w_pae=0.25, w_rg=0.10, w_contact_recon=0.05),
-    "B_pae_heavy": CompositeWeights(w_ptm=0.20, w_plddt=0.15, w_pae=0.40, w_rg=0.15, w_contact_recon=0.10),
-    "C_balanced": CompositeWeights(w_ptm=0.25, w_plddt=0.20, w_pae=0.25, w_rg=0.15, w_contact_recon=0.15),
-    "D_physical": CompositeWeights(w_ptm=0.15, w_plddt=0.15, w_pae=0.30, w_rg=0.25, w_contact_recon=0.15),
+    "A_ptm_heavy": CompositeWeights(w_ptm=0.35, w_plddt=0.15, w_pae=0.20, w_rg=0.20, w_contact_recon=0.10),
+    "B_pae_heavy": CompositeWeights(w_ptm=0.15, w_plddt=0.10, w_pae=0.35, w_rg=0.25, w_contact_recon=0.15),
+    "C_balanced": CompositeWeights(w_ptm=0.20, w_plddt=0.15, w_pae=0.25, w_rg=0.25, w_contact_recon=0.15),
+    "D_physical": CompositeWeights(w_ptm=0.10, w_plddt=0.10, w_pae=0.25, w_rg=0.35, w_contact_recon=0.20),
 }
 
-THRESHOLD_PRESETS: list[float] = [0.40, 0.45, 0.50]
+THRESHOLD_PRESETS: list[float] = [0.45, 0.50, 0.55]
