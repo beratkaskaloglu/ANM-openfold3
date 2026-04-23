@@ -849,9 +849,15 @@ class ModeDrivePipeline:
             # L9 Rg guard: reject physically nonsensical structures from candidate pool
             if result.rg_ratio is not None and result.rg_ratio > cfg.confidence_rg_max:
                 if cfg.autostop_verbose:
+                    skip_extra = f"  RMSD_init={result.rmsd:.2f}A"
+                    if target_coords is not None and result.new_ca is not None:
+                        skip_extra += (
+                            f"  RMSD_tgt={compute_rmsd(result.new_ca, target_coords):.2f}A"
+                            f"  TM_tgt={tm_score(result.new_ca, target_coords):.3f}"
+                        )
                     print(
                         f"      [FB L{level}] SKIP  Rg={result.rg_ratio:.1f} "
-                        f"> {cfg.confidence_rg_max} — {desc}"
+                        f"> {cfg.confidence_rg_max} — {desc}{skip_extra}"
                     )
                 return False
 
