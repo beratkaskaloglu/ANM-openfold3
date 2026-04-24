@@ -18,21 +18,28 @@ import torch
 
 @dataclass
 class CompositeWeights:
-    """Weights for composite confidence score. Must sum to ~1.0."""
+    """Weights for composite confidence score. Must sum to ~1.0.
+
+    rg_normalizer: Rg normalizasyon fonksiyonu secimi.
+        "quadratic" -> normalize_rg (varsayilan, uyumlu)
+        "strict"    -> normalize_rg_strict (cubic, physical presetler icin)
+    """
 
     w_ptm: float = 0.25
     w_plddt: float = 0.20
     w_pae: float = 0.25
     w_rg: float = 0.15
     w_contact_recon: float = 0.15
+    rg_normalizer: str = "quadratic"  # "quadratic" | "strict"
 
-    def as_dict(self) -> dict[str, float]:
+    def as_dict(self) -> dict[str, float | str]:
         return {
             "w_ptm": self.w_ptm,
             "w_plddt": self.w_plddt,
             "w_pae": self.w_pae,
             "w_rg": self.w_rg,
             "w_contact_recon": self.w_contact_recon,
+            "rg_normalizer": self.rg_normalizer,
         }
 
     @property
@@ -79,6 +86,26 @@ def normalize_rg(rg_ratio: float | None) -> float:
     return _clamp(1.0 - (dev / 1.0) ** 2)
 
 
+def normalize_rg_strict(rg_ratio: float | None) -> float:
+    """Rg ratio -> normalized (siki versiyon). Kucuk sapmalara daha agresif ceza.
+
+    Cubic penalty + dar pencere: Rg>1.5'te hizla sifira duser.
+    V3 D_physical verisinde Rg=1.3 bile yapisal bozulma baslangici gosterdi.
+    Bu fonksiyon Rg=1.3'e 0.84 (vs quadratic 0.91) vererek
+    physical presetlerde daha siki filtreleme saglar.
+
+      Rg=1.0 -> 1.00, Rg=1.1 -> 0.97, Rg=1.2 -> 0.91
+      Rg=1.3 -> 0.84, Rg=1.5 -> 0.65, Rg=1.7 -> 0.41
+      Rg=1.8 -> 0.28, Rg=2.0 -> 0.00, Rg<0.5 -> 0.65
+    """
+    if rg_ratio is None:
+        return 0.5
+    dev = abs(rg_ratio - 1.0)
+    # Cubic: (dev/1.0)^1.5 — daha agresif, Rg=1.5'te 0.50'ye duser
+    # Sifir noktasi yine dev=1.0 (Rg=2.0)
+    return _clamp(1.0 - (dev / 1.0) ** 1.5)
+
+
 def normalize_contact_recon(cr: float | None) -> float:
     """Contact reconstruction Pearson r -> normalized. [-0.1, 0.7] -> [0, 1]."""
     if cr is None:
@@ -106,7 +133,9 @@ def compute_composite(
     n_ptm = normalize_ptm(ptm)
     n_plddt = normalize_plddt(plddt_mean)
     n_pae = normalize_pae(mean_pae)
-    n_rg = normalize_rg(rg_ratio)
+    # Rg normalizasyonu: preset'e gore quadratic veya strict secilir
+    _rg_fn = normalize_rg_strict if weights.rg_normalizer == "strict" else normalize_rg
+    n_rg = _rg_fn(rg_ratio)
     n_cr = normalize_contact_recon(contact_recon)
 
     score = (
@@ -157,6 +186,27 @@ WEIGHT_PRESETS: dict[str, CompositeWeights] = {
     "B_pae_heavy": CompositeWeights(w_ptm=0.15, w_plddt=0.10, w_pae=0.35, w_rg=0.25, w_contact_recon=0.15),
     "C_balanced": CompositeWeights(w_ptm=0.20, w_plddt=0.15, w_pae=0.25, w_rg=0.25, w_contact_recon=0.15),
     "D_physical": CompositeWeights(w_ptm=0.10, w_plddt=0.10, w_pae=0.25, w_rg=0.35, w_contact_recon=0.20),
+    # V4 physical-focused presetler: alpha=0.3 + ptm_cutoff=0.50 ile kullanilacak.
+    # V3 D_physical analizi: Rg=1.3'te n_rg=0.92 (quadratic) cok yuksek,
+    # contact_recon daima ~1.0 (doymus), pTM contributionu cok dusuk.
+    # strict normalizer Rg=1.3'e 0.84 verir (vs quadratic 0.91) — daha gercekci filtre.
+    "E_physical_strict": CompositeWeights(
+        w_ptm=0.05, w_plddt=0.10, w_pae=0.25, w_rg=0.40, w_contact_recon=0.20,
+        rg_normalizer="strict",
+    ),
+    "F_physical_balanced": CompositeWeights(
+        w_ptm=0.10, w_plddt=0.10, w_pae=0.25, w_rg=0.30, w_contact_recon=0.25,
+        rg_normalizer="strict",
+    ),
+    "G_rg_dominant": CompositeWeights(
+        w_ptm=0.05, w_plddt=0.05, w_pae=0.20, w_rg=0.50, w_contact_recon=0.20,
+        rg_normalizer="strict",
+    ),
 }
 
+# Varsayilan threshold listesi (A/B/C presetleri icin)
 THRESHOLD_PRESETS: list[float] = [0.45, 0.50, 0.55]
+
+# Physical presetler icin genisletilmis threshold listesi
+# V3'te D_physical_t0.55 en iyi TM'yi verdi — daha siki threshold'lar da test edilmeli
+THRESHOLD_PRESETS_PHYSICAL: list[float] = [0.40, 0.45, 0.50, 0.55]

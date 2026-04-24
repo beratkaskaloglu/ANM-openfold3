@@ -447,6 +447,8 @@ class TestFallbackLevels:
         pipe.config.fallback_max_combo_size = 1
         pipe.config.fallback_alpha_factor = 0.5
         pipe.config.fallback_extended_enabled = False  # disable L5 for speed
+        pipe.config.confidence_rg_min = 0.0            # random data can have low Rg
+        pipe.config.confidence_rmsd_init_max = 0       # disable for test (random coords)
 
         pipe.diffusion_fn = lambda z: _FakeDiffResult(
             torch.randn(z.shape[0], 3), ptm=diff_ptm
@@ -463,6 +465,8 @@ class TestFallbackLevels:
         pipe = self._make_failing_pipeline(ptm_cutoff=0.05, diff_ptm=0.1)
         pipe.config.confidence_ranking_cutoff = 0.01  # low enough to pass
         pipe.config.confidence_plddt_cutoff = 10.0     # low enough to pass
+        pipe.config.confidence_rg_min = 0.0            # random data may have low Rg
+        pipe.config.confidence_rmsd_init_max = 0       # disable rmsd_init cutoff for test
         coords, zij = _random_inputs()
         result = pipe.step_with_fallback(coords, coords, zij)
         assert result.fallback_level == 0
@@ -548,6 +552,7 @@ class TestFallbackReturnPaths:
             max_combo_size=2,
             df=0.6, df_min=0.3, df_max=0.6,  # no escalation
             confidence_rg_min=0.0, confidence_rg_max=100.0,  # disable Rg for tests
+            confidence_rmsd_init_max=0,  # disable rmsd_init cutoff for tests
             enable_confidence_fallback=True,
             confidence_ptm_cutoff=0.5,
             confidence_plddt_cutoff=10.0,

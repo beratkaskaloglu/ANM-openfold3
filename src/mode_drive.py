@@ -561,6 +561,10 @@ class ModeDrivePipeline:
             if result.rg_ratio < cfg.confidence_rg_min:
                 return False, f"Rg={result.rg_ratio:.2f}<{cfg.confidence_rg_min}"
 
+        # rmsd_init hard cutoff — V3 analiz: >10A olan yapılar DAIMA kötü TM veriyor
+        if cfg.confidence_rmsd_init_max > 0 and result.rmsd > cfg.confidence_rmsd_init_max:
+            return False, f"rmsd_init={result.rmsd:.1f}>{cfg.confidence_rmsd_init_max}"
+
         if cfg.confidence_clash_reject and result.has_clash:
             return False, "clash"
 
@@ -858,6 +862,15 @@ class ModeDrivePipeline:
                     print(
                         f"      [FB L{level}] SKIP  Rg={result.rg_ratio:.1f} "
                         f"> {cfg.confidence_rg_max} — {desc}{skip_extra}"
+                    )
+                return False
+
+            # rmsd_init hard cutoff — V3 analiz: >10A yapılar kurtarılamaz
+            if cfg.confidence_rmsd_init_max > 0 and result.rmsd > cfg.confidence_rmsd_init_max:
+                if cfg.autostop_verbose:
+                    print(
+                        f"      [FB L{level}] SKIP  rmsd_init={result.rmsd:.1f}A "
+                        f"> {cfg.confidence_rmsd_init_max} — {desc}"
                     )
                 return False
 
@@ -1244,9 +1257,19 @@ class ModeDrivePipeline:
 
         use_fallback = cfg.enable_confidence_fallback
 
+        # Best-so-far rollback: en iyi yapıyı takip et, drift sonrası geri dön
+        coords_best = initial_coords_ca.clone()
+        z_best = zij_trunk.clone()
+        tm_best = 0.0  # target yoksa kullanılmaz
+        best_step_idx = -1  # hangi step'te best kaydedildi
+
+        # Adaptive early stopping: ardışık TM düşüşü takibi
+        accepted_tm_history: list[float] = []  # sadece accepted step'lerin TM değerleri
+
+        has_target = target_coords is not None
+
         if verbose:
             N = initial_coords_ca.shape[0]
-            has_target = target_coords is not None
             header = f"{'Step':>6} {'RMSD_init':>10} {'df':>6} {'a':>5} {'Combo':>20}"
             if has_target:
                 header += f" {'RMSD_tgt':>10} {'TM_tgt':>8}"
@@ -1336,6 +1359,54 @@ class ModeDrivePipeline:
                 z_current = step_result.z_modified
                 consecutive_rejected = 0
                 cfg.z_mixing_alpha = orig_alpha  # restore on success
+
+                # ── Best-so-far rollback takibi ──
+                if has_target and cfg.enable_best_rollback:
+                    current_tm = tm_score(step_result.new_ca, target_coords)
+
+                    # Yeni best kaydet
+                    if current_tm > tm_best:
+                        tm_best = current_tm
+                        coords_best = step_result.new_ca.clone()
+                        z_best = step_result.z_modified.clone()
+                        best_step_idx = step_idx
+
+                    # Drift tespiti: mevcut TM, best'ten %40+ düşükse geri dön
+                    elif tm_best > 0 and current_tm < tm_best * (1.0 - cfg.best_rollback_tm_drop):
+                        if verbose:
+                            print(
+                                f"  ROLLBACK: TM={current_tm:.3f} < best={tm_best:.3f} * "
+                                f"{1.0 - cfg.best_rollback_tm_drop:.2f} — "
+                                f"step {best_step_idx+1}'e geri donuluyor"
+                            )
+                        coords_ca = coords_best.clone()
+                        z_current = z_best.clone()
+
+                    # Adaptive early stopping: TM takibi
+                    if cfg.enable_adaptive_stop:
+                        accepted_tm_history.append(current_tm)
+
+                        # N ardışık accepted step'te monoton azalış kontrolü
+                        w = cfg.adaptive_stop_window
+                        if len(accepted_tm_history) >= w + 1:
+                            recent = accepted_tm_history[-(w + 1):]
+                            # Son w geçiş hepsi düşüş mü?
+                            monoton_azalis = all(
+                                recent[i] > recent[i + 1]
+                                for i in range(len(recent) - 1)
+                            )
+                            if monoton_azalis:
+                                if verbose:
+                                    tm_seq = " -> ".join(f"{t:.3f}" for t in recent)
+                                    print(
+                                        f"  EARLY STOP: {w} ardisik accepted step'te TM dusus: "
+                                        f"{tm_seq} — en iyi yapi donduruluyor (step {best_step_idx+1})"
+                                    )
+                                # En iyi yapıyı trajectory'nin sonuna ekle
+                                if best_step_idx >= 0:
+                                    result.trajectory.append(coords_best.clone())
+                                break
+
             else:
                 consecutive_rejected += 1
                 # Alpha decay on rejection (stall prevention)

@@ -36,7 +36,10 @@ from .mode_drive_utils import compute_rmsd, kabsch_superimpose, tm_score, make_p
 from .mode_drive import ModeDrivePipeline
 
 # Composite confidence scoring
-from .composite_confidence import CompositeWeights, compute_composite, composite_score_from_step
+from .composite_confidence import (
+    CompositeWeights, compute_composite, composite_score_from_step,
+    normalize_rg_strict, WEIGHT_PRESETS, THRESHOLD_PRESETS, THRESHOLD_PRESETS_PHYSICAL,
+)
 
 # OF3 diffusion (lazy import — requires openfold3-repo)
 def load_of3_diffusion(*args, **kwargs):

@@ -60,7 +60,7 @@ class ModeDriveConfig:
 
     # Confidence & multi-sample
     num_diffusion_samples: int = 1               # K: samples per diffusion call
-    confidence_ptm_cutoff: float = 0.5           # minimum pTM to accept step (0-1)
+    confidence_ptm_cutoff: float = 0.50          # minimum pTM to accept step (0-1, V3 analiz: 0.50 optimal)
     confidence_plddt_cutoff: float = 70.0        # minimum mean pLDDT to accept (0-100 scale, OF3 native)
     confidence_ranking_cutoff: float = 0.5       # minimum ranking score to accept
 
@@ -72,6 +72,7 @@ class ModeDriveConfig:
     confidence_rg_max: float = 2.5                        # max Rg ratio (>2.5 = yapı patlamış)
     confidence_rg_min: float = 0.3                        # min Rg ratio (<0.3 = aşırı sıkışmış)
     confidence_clash_reject: bool = True                  # has_clash=True → reject
+    confidence_rmsd_init_max: float = 10.0                # rmsd_init hard cutoff (V3: >10A = yapı kurtarılamaz)
 
     # Warmup: ilk N step'te cutoff'ları gevşet
     confidence_warmup_steps: int = 0                      # 0=disabled
@@ -81,6 +82,14 @@ class ModeDriveConfig:
     # Stall prevention
     max_consecutive_rejected: int = 0                     # 0=unlimited, >0 = stop after N consecutive rejected
     rejected_alpha_decay: float = 1.0                     # multiply alpha by this after each rejected step (1.0=no decay)
+
+    # Best-so-far rollback: drift sonrası en iyi yapıya geri dön
+    enable_best_rollback: bool = True                     # best-so-far rollback mekanizması
+    best_rollback_tm_drop: float = 0.40                   # mevcut TM, best'ten bu oranda düşükse geri dön (0.40 = %40 düşüş)
+
+    # Adaptive early stopping: ardışık TM düşüşünde pipeline'ı durdur
+    enable_adaptive_stop: bool = True                     # adaptive early stopping
+    adaptive_stop_window: int = 3                         # N ardışık accepted step'te TM düşüyorsa durdur
 
     # Adaptive fallback
     enable_confidence_fallback: bool = False      # enable confidence-guided fallback
