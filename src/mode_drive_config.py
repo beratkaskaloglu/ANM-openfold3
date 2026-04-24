@@ -160,6 +160,16 @@ class ModeDriveConfig:
     # Max cells per extended grid (L7, L8) — prevents combinatorial blow-up.
     autostop_fallback_grid_cap: int = 8
 
+    # ─────────────── Selective mixing — per-pair adaptive alpha ───────────────
+    selective_mixing: bool = False                    # False = mevcut uniform davranış
+    selective_w_connectivity: float = 0.5             # ΔC ağırlığı
+    selective_w_distance: float = 0.5                 # ΔD ağırlığı
+    selective_change_cutoff: float = 0.1              # bu eşiğin altı → alpha_base
+    selective_alpha_base: float = 0.0                 # değişmeyen pair'ler için alpha
+    selective_alpha_max: float = 1.0                  # max değişim olan pair'ler için alpha
+    selective_mapping: str = "linear"                 # "linear", "sigmoid", "step"
+    selective_distance_mode: str = "max"              # "max", "mean"
+
 
 @dataclass
 class StepResult:
@@ -194,6 +204,12 @@ class StepResult:
     contact_recon: float | None = None        # Pearson r: contact(displaced) vs contact(new_ca)
     contact_of3: float | None = None          # Pearson r: contact(displaced) vs OF3 distogram
     rg_ratio: float | None = None             # Rg_observed / Rg_expected
+
+    # Selective mixing diagnostics (None when selective_mixing=False)
+    change_score_mean: float | None = None
+    change_score_max: float | None = None
+    n_active_pairs: int | None = None               # pair count above cutoff
+    alpha_mask_mean: float | None = None
 
     # Autostop strategy diagnostics (None when strategy != "autostop")
     autostop_info: dict | None = None

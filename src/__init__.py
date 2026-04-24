@@ -35,6 +35,9 @@ from .mode_drive_config import ModeDriveConfig, ModeDriveResult, StepResult
 from .mode_drive_utils import compute_rmsd, kabsch_superimpose, tm_score, make_pseudo_diffusion
 from .mode_drive import ModeDrivePipeline
 
+# Selective mixing
+from .selective_mixing import compute_change_score, compute_alpha_mask, selective_blend_z
+
 # Composite confidence scoring
 from .composite_confidence import (
     CompositeWeights, compute_composite, composite_score_from_step,

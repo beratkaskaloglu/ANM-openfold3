@@ -167,20 +167,60 @@ class ModeDrivePipeline:
         self,
         z_pseudo: torch.Tensor,
         zij_trunk: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply delta_z to trunk z_ij in the configured direction."""
-        alpha = self.config.z_mixing_alpha
+        coords_before: torch.Tensor | None = None,
+        displaced: torch.Tensor | None = None,
+        initial_coords: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Apply delta_z to trunk z_ij, optionally with per-pair adaptive alpha.
 
-        if self.config.normalize_z:
+        When selective_mixing is enabled and coordinate tensors are provided,
+        computes a per-pair alpha mask based on connectivity and distance changes.
+        Otherwise falls back to uniform alpha blending.
+
+        Returns:
+            (z_mod, change_score, alpha_mask) — change_score and alpha_mask are
+            None when selective mixing is not active.
+        """
+        cfg = self.config
+
+        if (
+            cfg.selective_mixing
+            and coords_before is not None
+            and displaced is not None
+            and initial_coords is not None
+        ):
+            from .selective_mixing import compute_change_score, compute_alpha_mask, selective_blend_z
+
+            change_score = compute_change_score(
+                coords_before, displaced, initial_coords,
+                cfg.contact_r_cut, cfg.contact_tau,
+                cfg.selective_w_connectivity, cfg.selective_w_distance,
+                cfg.selective_distance_mode,
+            )
+            alpha_mask = compute_alpha_mask(
+                change_score, cfg.selective_change_cutoff,
+                cfg.selective_alpha_base, cfg.selective_alpha_max,
+                cfg.selective_mapping,
+            )
+            z_mod = selective_blend_z(
+                z_pseudo, zij_trunk, alpha_mask,
+                cfg.normalize_z, cfg.z_direction,
+            )
+            return z_mod, change_score, alpha_mask
+
+        # Uniform path (existing behaviour — unchanged)
+        alpha = cfg.z_mixing_alpha
+
+        if cfg.normalize_z:
             z_pseudo = (z_pseudo - z_pseudo.mean()) / (z_pseudo.std() + 1e-8)
             z_pseudo = z_pseudo * zij_trunk.std() + zij_trunk.mean()
 
         delta_z = z_pseudo - zij_trunk
 
-        if self.config.z_direction == "minus":
-            return zij_trunk - alpha * delta_z
+        if cfg.z_direction == "minus":
+            return zij_trunk - alpha * delta_z, None, None
         else:  # "plus"
-            return zij_trunk + alpha * delta_z
+            return zij_trunk + alpha * delta_z, None, None
 
     def _evaluate_combo(
         self,
@@ -214,6 +254,7 @@ class ModeDrivePipeline:
             eigenvectors=eigenvectors,
             b_factors=b_factors,
             df_used=df_used,
+            coords_before=coords_ca,
         )
 
     def _downstream_from_displaced(
@@ -227,6 +268,7 @@ class ModeDrivePipeline:
         b_factors: torch.Tensor,
         df_used: float,
         autostop_info: dict | None = None,
+        coords_before: torch.Tensor | None = None,
     ) -> StepResult:
         """Common downstream path from a displaced-CA tensor.
 
@@ -244,7 +286,12 @@ class ModeDrivePipeline:
         z_pseudo = self.converter.contact_to_z(contact)
 
         # Blend with trunk z
-        z_mod = self._blend_z(z_pseudo, zij_trunk)
+        z_mod, change_score, alpha_mask = self._blend_z(
+            z_pseudo, zij_trunk,
+            coords_before=coords_before,
+            displaced=displaced,
+            initial_coords=initial_coords_ca,
+        )
 
         # Run diffusion if available, otherwise use displaced as proxy
         plddt_out = None
@@ -312,6 +359,17 @@ class ModeDrivePipeline:
         rg_exp = 2.2 * (N ** 0.38)
         rg_ratio_out = rg_obs / max(rg_exp, 1e-6)
 
+        # Selective mixing diagnostics
+        cs_mean_out = None
+        cs_max_out = None
+        n_active_out = None
+        am_mean_out = None
+        if change_score is not None and alpha_mask is not None:
+            cs_mean_out = float(change_score.mean().item())
+            cs_max_out = float(change_score.max().item())
+            n_active_out = int((change_score >= cfg.selective_change_cutoff).sum().item())
+            am_mean_out = float(alpha_mask.mean().item())
+
         return StepResult(
             combo=combo,
             displaced_ca=displaced,
@@ -330,6 +388,10 @@ class ModeDrivePipeline:
             all_ptm=all_ptm_out,
             all_ranking=all_ranking_out,
             num_samples=num_samples_out,
+            change_score_mean=cs_mean_out,
+            change_score_max=cs_max_out,
+            n_active_pairs=n_active_out,
+            alpha_mask_mean=am_mean_out,
             autostop_info=autostop_info,
             mean_pae=mean_pae_out,
             has_clash=has_clash_out,
@@ -427,6 +489,7 @@ class ModeDrivePipeline:
             pick, initial_coords_ca, zij_trunk,
             eigenvalues, eigenvectors, b_factors,
             step_idx, fallback_level=0, trace_stats=trace_stats,
+            coords_before=coords_ca,
         )
 
     @torch.no_grad()
@@ -758,6 +821,7 @@ class ModeDrivePipeline:
         step_idx: int,
         fallback_level: int,
         trace_stats: dict,
+        coords_before: torch.Tensor | None = None,
     ) -> StepResult:
         """Build a StepResult from an autostop pick -- reused across fallback levels."""
         combo = self._autostop_synthetic_combo(
@@ -789,6 +853,7 @@ class ModeDrivePipeline:
             b_factors=b_factors,
             df_used=0.0,
             autostop_info=autostop_info,
+            coords_before=coords_before,
         )
         result.fallback_level = fallback_level
         return result
@@ -981,6 +1046,7 @@ class ModeDrivePipeline:
                     pick0, initial_coords_ca, zij_trunk,
                     eigenvalues, eigenvectors, b_factors,
                     step_idx, fallback_level=0, trace_stats=_trace_stats(tr0),
+                    coords_before=coords_ca,
                 )
                 if _track(
                     result0, level=0,
@@ -1009,6 +1075,7 @@ class ModeDrivePipeline:
                         pick, initial_coords_ca, zij_trunk,
                         eigenvalues, eigenvectors, b_factors,
                         step_idx, fallback_level=1, trace_stats=_trace_stats(trace),
+                        coords_before=coords_ca,
                     )
                     if _track(
                         res, level=1,
@@ -1028,6 +1095,7 @@ class ModeDrivePipeline:
                         pick, initial_coords_ca, zij_trunk,
                         eigenvalues, eigenvectors, b_factors,
                         step_idx, fallback_level=2, trace_stats=_trace_stats(tr),
+                        coords_before=coords_ca,
                     )
                     if _track(
                         res, level=2,
@@ -1050,6 +1118,7 @@ class ModeDrivePipeline:
                             pick, initial_coords_ca, zij_trunk,
                             eigenvalues, eigenvectors, b_factors,
                             step_idx, fallback_level=3, trace_stats=_trace_stats(trace),
+                            coords_before=coords_ca,
                         )
                         if _track(
                             res, level=3,
@@ -1069,6 +1138,7 @@ class ModeDrivePipeline:
                         pick, initial_coords_ca, zij_trunk,
                         eigenvalues, eigenvectors, b_factors,
                         step_idx, fallback_level=4, trace_stats=_trace_stats(trace),
+                        coords_before=coords_ca,
                     )
                     if _track(
                         res, level=4,
@@ -1090,6 +1160,7 @@ class ModeDrivePipeline:
                         pick, initial_coords_ca, zij_trunk,
                         eigenvalues, eigenvectors, b_factors,
                         step_idx, fallback_level=5, trace_stats=_trace_stats(trace),
+                        coords_before=coords_ca,
                     )
                     if _track(
                         res, level=5,
@@ -1110,6 +1181,7 @@ class ModeDrivePipeline:
                         pick, initial_coords_ca, zij_trunk,
                         eigenvalues, eigenvectors, b_factors,
                         step_idx, fallback_level=6, trace_stats=_trace_stats(trace),
+                        coords_before=coords_ca,
                     )
                     if _track(
                         res, level=6,
@@ -1142,6 +1214,7 @@ class ModeDrivePipeline:
                                 pick, initial_coords_ca, zij_trunk,
                                 eigenvalues, eigenvectors, b_factors,
                                 step_idx, fallback_level=7, trace_stats=_trace_stats(tr_v),
+                                coords_before=coords_ca,
                             )
                             tried += 1
                             if _track(
@@ -1183,6 +1256,7 @@ class ModeDrivePipeline:
                                     pick, initial_coords_ca, zij_trunk,
                                     eigenvalues, eigenvectors, b_factors,
                                     step_idx, fallback_level=8, trace_stats=_trace_stats(trace),
+                                    coords_before=coords_ca,
                                 )
                                 tried += 1
                                 if _track(
@@ -1215,6 +1289,7 @@ class ModeDrivePipeline:
                 pick, initial_coords_ca, zij_trunk,
                 eigenvalues, eigenvectors, b_factors,
                 step_idx, fallback_level=9, trace_stats=_trace_stats(tr),
+                coords_before=coords_ca,
             )
             res.rejected = True
             if cfg.autostop_verbose:

@@ -64,7 +64,7 @@ class TestBlendZ:
         pipe.config.z_direction = "plus"
         zij = torch.randn(5, 5, 128)
         z_pseudo = torch.randn(5, 5, 128)
-        blended = pipe._blend_z(z_pseudo, zij)
+        blended, _, _ = pipe._blend_z(z_pseudo, zij)
         assert blended.shape == (5, 5, 128)
         # Not identical to either input
         assert not torch.allclose(blended, zij)
@@ -74,7 +74,7 @@ class TestBlendZ:
         pipe.config.z_direction = "minus"
         zij = torch.randn(5, 5, 128)
         z_pseudo = torch.randn(5, 5, 128)
-        blended = pipe._blend_z(z_pseudo, zij)
+        blended, _, _ = pipe._blend_z(z_pseudo, zij)
         assert blended.shape == (5, 5, 128)
 
     def test_alpha_zero_returns_trunk(self):
@@ -82,7 +82,7 @@ class TestBlendZ:
         pipe.config.normalize_z = False
         zij = torch.randn(5, 5, 128)
         z_pseudo = torch.randn(5, 5, 128)
-        blended = pipe._blend_z(z_pseudo, zij)
+        blended, _, _ = pipe._blend_z(z_pseudo, zij)
         torch.testing.assert_close(blended, zij)
 
     def test_normalize_z_enabled(self):
@@ -90,7 +90,7 @@ class TestBlendZ:
         pipe.config.normalize_z = True
         zij = torch.randn(5, 5, 128) * 0.1
         z_pseudo = torch.randn(5, 5, 128) * 100.0  # very different scale
-        blended = pipe._blend_z(z_pseudo, zij)
+        blended, _, _ = pipe._blend_z(z_pseudo, zij)
         assert blended.shape == (5, 5, 128)
         assert torch.isfinite(blended).all()
 
@@ -99,7 +99,7 @@ class TestBlendZ:
         pipe.config.normalize_z = False
         zij = torch.randn(5, 5, 128)
         z_pseudo = torch.randn(5, 5, 128)
-        blended = pipe._blend_z(z_pseudo, zij)
+        blended, _, _ = pipe._blend_z(z_pseudo, zij)
         assert blended.shape == (5, 5, 128)
 
 
