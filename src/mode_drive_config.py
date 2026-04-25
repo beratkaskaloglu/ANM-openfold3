@@ -60,9 +60,9 @@ class ModeDriveConfig:
 
     # Confidence & multi-sample
     num_diffusion_samples: int = 1               # K: samples per diffusion call
-    confidence_ptm_cutoff: float = 0.50          # minimum pTM to accept step (0-1, V3 analiz: 0.50 optimal)
-    confidence_plddt_cutoff: float = 70.0        # minimum mean pLDDT to accept (0-100 scale, OF3 native)
-    confidence_ranking_cutoff: float = 0.5       # minimum ranking score to accept
+    confidence_ptm_cutoff: float = 0.30          # safety net only (V5: 0.50 çok sıkı, TM>0.75 yapıları reject ediyordu)
+    confidence_plddt_cutoff: float = 65.0        # minimum mean pLDDT (V5: 70 gereksiz sıkı, selective'de ~70-76 arası)
+    confidence_ranking_cutoff: float = 0.45      # PRIMARY gate: rank=0.8*pTM+0.2*(pLDDT/100) — V5: rank>=0.45 → TM>0.55
 
     # Confidence V2 — additional metrics (None = disabled)
     confidence_mean_pae_cutoff: float | None = None       # max mean PAE to accept
@@ -76,8 +76,8 @@ class ModeDriveConfig:
 
     # Warmup: ilk N step'te cutoff'ları gevşet
     confidence_warmup_steps: int = 0                      # 0=disabled
-    confidence_warmup_ptm_cutoff: float = 0.35            # warmup sırasında pTM cutoff
-    confidence_warmup_ranking_cutoff: float = 0.40        # warmup sırasında ranking cutoff
+    confidence_warmup_ptm_cutoff: float = 0.25            # warmup sırasında pTM cutoff
+    confidence_warmup_ranking_cutoff: float = 0.35        # warmup sırasında ranking cutoff
 
     # Stall prevention
     max_consecutive_rejected: int = 0                     # 0=unlimited, >0 = stop after N consecutive rejected
@@ -210,6 +210,7 @@ class StepResult:
     change_score_max: float | None = None
     n_active_pairs: int | None = None               # pair count above cutoff
     alpha_mask_mean: float | None = None
+    alpha_mask_snapshot: torch.Tensor | None = None  # [N, N] full mask for heatmap visualization
 
     # Autostop strategy diagnostics (None when strategy != "autostop")
     autostop_info: dict | None = None

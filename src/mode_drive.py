@@ -364,11 +364,13 @@ class ModeDrivePipeline:
         cs_max_out = None
         n_active_out = None
         am_mean_out = None
+        am_snapshot_out = None
         if change_score is not None and alpha_mask is not None:
             cs_mean_out = float(change_score.mean().item())
             cs_max_out = float(change_score.max().item())
             n_active_out = int((change_score >= cfg.selective_change_cutoff).sum().item())
             am_mean_out = float(alpha_mask.mean().item())
+            am_snapshot_out = alpha_mask.detach().cpu().clone()
 
         return StepResult(
             combo=combo,
@@ -392,6 +394,7 @@ class ModeDrivePipeline:
             change_score_max=cs_max_out,
             n_active_pairs=n_active_out,
             alpha_mask_mean=am_mean_out,
+            alpha_mask_snapshot=am_snapshot_out,
             autostop_info=autostop_info,
             mean_pae=mean_pae_out,
             has_clash=has_clash_out,
