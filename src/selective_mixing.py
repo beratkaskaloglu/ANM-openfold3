@@ -159,15 +159,21 @@ def selective_blend_z(
     alpha_mask: Tensor,
     normalize: bool = True,
     direction: str = "plus",
+    diagonal_band: int = 1,
 ) -> Tensor:
     """Blend z_pseudo into z_trunk with per-pair alpha mask.
 
+    Diagonal and near-diagonal positions (|i-j| <= diagonal_band) are
+    always kept from z_trunk (no mixing). These represent self-pairs and
+    backbone neighbors whose local geometry should be preserved.
+
     Args:
-        z_pseudo:   [N, N, C] pseudo pair representation from contact map.
-        z_trunk:    [N, N, C] trunk pair representation from OF3.
-        alpha_mask: [N, N] per-pair alpha values.
-        normalize:  If True, normalize z_pseudo stats to match z_trunk.
-        direction:  "plus" or "minus" — add or subtract delta_z.
+        z_pseudo:       [N, N, C] pseudo pair representation from contact map.
+        z_trunk:        [N, N, C] trunk pair representation from OF3.
+        alpha_mask:     [N, N] per-pair alpha values.
+        normalize:      If True, normalize z_pseudo stats to match z_trunk.
+        direction:      "plus" or "minus" — add or subtract delta_z.
+        diagonal_band:  Mask |i-j| <= this from mixing (default 1: diagonal + ±1).
 
     Returns:
         z_blended: [N, N, C] blended pair representation.
@@ -178,8 +184,17 @@ def selective_blend_z(
 
     delta_z = z_pseudo - z_trunk
 
+    # Mask diagonal band: |i-j| <= diagonal_band → alpha = 0 (keep trunk)
+    N = alpha_mask.shape[0]
+    mask = alpha_mask.clone()
+    idx = torch.arange(N, device=mask.device)
+    for offset in range(-diagonal_band, diagonal_band + 1):
+        i_idx = idx[max(0, offset):min(N, N + offset)]
+        j_idx = idx[max(0, -offset):min(N, N - offset)]
+        mask[i_idx, j_idx] = 0.0
+
     # Expand alpha_mask to broadcast over channel dimension: [N, N, 1]
-    alpha_expanded = alpha_mask.unsqueeze(-1)
+    alpha_expanded = mask.unsqueeze(-1)
 
     if direction == "minus":
         return z_trunk - alpha_expanded * delta_z
