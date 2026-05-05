@@ -63,6 +63,8 @@ class ModeDriveConfig:
     confidence_ptm_cutoff: float = 0.30          # safety net only (V5: 0.50 çok sıkı, TM>0.75 yapıları reject ediyordu)
     confidence_plddt_cutoff: float = 65.0        # minimum mean pLDDT (V5: 70 gereksiz sıkı, selective'de ~70-76 arası)
     confidence_ranking_cutoff: float = 0.45      # PRIMARY gate: rank=0.8*pTM+0.2*(pLDDT/100) — V5: rank>=0.45 → TM>0.55
+    use_composite_gate: bool = True              # True: ranking gate yerine composite score kullan (PAE+Rg+cR dahil)
+    composite_gate_threshold: float = 0.45       # composite gate threshold (ranking_cutoff ile ayni skala)
 
     # Confidence V2 — additional metrics (None = disabled)
     confidence_mean_pae_cutoff: float | None = None       # max mean PAE to accept
