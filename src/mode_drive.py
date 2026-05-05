@@ -601,6 +601,53 @@ class ModeDrivePipeline:
 
         return best_overall
 
+    def _compute_gate_score(self, result: StepResult) -> float:
+        """Data-driven gate score (708 step korelasyon analizinden).
+
+        Ağırlıklar TM_tgt ile korelasyona göre:
+          cR    r=+0.598 → w=0.45 (en güçlü pozitif sinyal)
+          pLDDT r=+0.271 → w=0.30
+          Rg    r=+0.061 → w=0.15 (fiziksel sağlamlık)
+          pTM   r=-0.236 → w=0.10 (ters korelasyon, düşük ağırlık)
+
+        Normalizasyon: her metrik [0, 1] aralığına map'lenir.
+        """
+        cfg = self.config
+
+        # cR: [0.85, 1.0] → [0, 1]  (cR<0.85 = kötü, >0.97 = çok iyi)
+        if result.contact_recon is not None:
+            n_cr = max(0.0, min(1.0, (result.contact_recon - 0.85) / 0.15))
+        else:
+            n_cr = 0.5
+
+        # pLDDT: [60, 90] → [0, 1]
+        if result.plddt is not None:
+            plddt_mean = float(result.plddt.mean().item())
+            n_plddt = max(0.0, min(1.0, (plddt_mean - 60.0) / 30.0))
+        else:
+            n_plddt = 0.5
+
+        # Rg: 1.0 = ideal, quadratic penalty
+        if result.rg_ratio is not None:
+            dev = abs(result.rg_ratio - 1.0)
+            n_rg = max(0.0, 1.0 - (dev / 0.8) ** 2)
+        else:
+            n_rg = 0.5
+
+        # pTM: [0, 0.8] → [0, 1] (düşük ağırlıkla, ters korelasyon ama minimum kalite)
+        if result.ptm is not None:
+            n_ptm = max(0.0, min(1.0, result.ptm / 0.8))
+        else:
+            n_ptm = 0.5
+
+        score = (
+            cfg.gate_w_cr * n_cr
+            + cfg.gate_w_plddt * n_plddt
+            + cfg.gate_w_rg * n_rg
+            + cfg.gate_w_ptm * n_ptm
+        )
+        return score
+
     def _confidence_check(self, result: StepResult, step_idx: int = 0) -> tuple[bool, str]:
         """Check if step result passes ALL confidence cutoffs (AND logic).
 
@@ -643,19 +690,12 @@ class ModeDrivePipeline:
             if mean_plddt < cfg.confidence_plddt_cutoff:
                 return False, f"pLDDT={mean_plddt:.1f}<{cfg.confidence_plddt_cutoff}"
 
-        # Ranking gate: composite (tum metrikler) veya eski OF3 ranking
+        # Ranking gate: data-driven (cR+pLDDT ağırlıklı) veya eski OF3 ranking
         if cfg.use_composite_gate:
-            plddt_mean = float(result.plddt.mean().item()) if result.plddt is not None else None
-            gate_score, _ = compute_composite(
-                ptm=result.ptm,
-                plddt_mean=plddt_mean,
-                mean_pae=result.mean_pae,
-                rg_ratio=result.rg_ratio,
-                contact_recon=result.contact_recon,
-            )
+            gate_score = self._compute_gate_score(result)
             gate_threshold = cfg.composite_gate_threshold
             if gate_score < gate_threshold:
-                return False, f"comp_gate={gate_score:.3f}<{gate_threshold}"
+                return False, f"gate={gate_score:.3f}<{gate_threshold}"
         elif (
             result.ranking_score is not None
             and result.ranking_score < rank_cut
@@ -725,21 +765,15 @@ class ModeDrivePipeline:
         best_result: StepResult | None = None
         best_ranking = -1.0
 
-        def _compute_gate_score(result: StepResult) -> float:
-            """Gate skoru: composite veya eski ranking."""
+        def _compute_gate_score_fb(result: StepResult) -> float:
+            """Gate skoru for fallback best-tracking."""
             if cfg.use_composite_gate:
-                plddt_mean = float(result.plddt.mean().item()) if result.plddt is not None else None
-                score, _ = compute_composite(
-                    ptm=result.ptm, plddt_mean=plddt_mean,
-                    mean_pae=result.mean_pae, rg_ratio=result.rg_ratio,
-                    contact_recon=result.contact_recon,
-                )
-                return score
+                return self._compute_gate_score(result)
             return result.ranking_score if result.ranking_score is not None else 0.0
 
         def _track(result: StepResult) -> bool:
             nonlocal best_result, best_ranking
-            r_score = _compute_gate_score(result)
+            r_score = _compute_gate_score_fb(result)
             if r_score > best_ranking:
                 best_ranking = r_score
                 best_result = result
@@ -938,15 +972,9 @@ class ModeDrivePipeline:
         best_ranking = -1.0
 
         def _compute_gate_score_autostop(result: StepResult) -> float:
-            """Gate skoru: composite veya eski ranking (autostop context)."""
+            """Gate skoru for autostop best-tracking."""
             if cfg.use_composite_gate:
-                plddt_mean = float(result.plddt.mean().item()) if result.plddt is not None else None
-                score, _ = compute_composite(
-                    ptm=result.ptm, plddt_mean=plddt_mean,
-                    mean_pae=result.mean_pae, rg_ratio=result.rg_ratio,
-                    contact_recon=result.contact_recon,
-                )
-                return score
+                return self._compute_gate_score(result)
             return result.ranking_score if result.ranking_score is not None else 0.0
 
         def _track(

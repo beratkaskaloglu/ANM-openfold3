@@ -62,9 +62,21 @@ class ModeDriveConfig:
     num_diffusion_samples: int = 1               # K: samples per diffusion call
     confidence_ptm_cutoff: float = 0.30          # safety net only (V5: 0.50 çok sıkı, TM>0.75 yapıları reject ediyordu)
     confidence_plddt_cutoff: float = 65.0        # minimum mean pLDDT (V5: 70 gereksiz sıkı, selective'de ~70-76 arası)
-    confidence_ranking_cutoff: float = 0.45      # PRIMARY gate: rank=0.8*pTM+0.2*(pLDDT/100) — V5: rank>=0.45 → TM>0.55
-    use_composite_gate: bool = True              # True: ranking gate yerine composite score kullan (PAE+Rg+cR dahil)
-    composite_gate_threshold: float = 0.45       # composite gate threshold (ranking_cutoff ile ayni skala)
+    confidence_ranking_cutoff: float = 0.45      # Eski OF3 ranking gate (use_composite_gate=False iken)
+    use_composite_gate: bool = True              # True: data-driven gate (cR+pLDDT ağırlıklı)
+    composite_gate_threshold: float = 0.55       # composite gate threshold
+
+    # Data-driven gate ağırlıkları (708 step korelasyon analizinden):
+    #   cR   r=+0.598 → en güçlü sinyal
+    #   pLDDT r=+0.271 → ikincil sinyal
+    #   pTM  r=-0.236 → TERS! yapı hedefe yaklaştıkça düşüyor
+    #   Rg   r=+0.061 → nötr
+    # OF3 pTM trunk MSA'ya bağlı — yapı değiştikçe sistematik düşer.
+    # cR ve pLDDT intrinsic kaliteyi ölçer, başlangıça bağımlı değil.
+    gate_w_cr: float = 0.45                     # contact reconstruction (en güçlü)
+    gate_w_plddt: float = 0.30                  # local confidence
+    gate_w_rg: float = 0.15                     # physical sanity
+    gate_w_ptm: float = 0.10                    # düşük ağırlık (ters korelasyon)
 
     # Confidence V2 — additional metrics (None = disabled)
     confidence_mean_pae_cutoff: float | None = None       # max mean PAE to accept
