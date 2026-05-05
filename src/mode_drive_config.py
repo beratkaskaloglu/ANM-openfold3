@@ -178,12 +178,12 @@ class ModeDriveConfig:
     selective_mixing: bool = False                    # False = mevcut uniform davranış
     selective_w_connectivity: float = 0.5             # ΔC ağırlığı
     selective_w_distance: float = 0.5                 # ΔD ağırlığı
-    selective_change_cutoff: float = 0.1              # bu eşiğin altı → alpha_base
-    selective_alpha_base: float = 0.0                 # değişmeyen pair'ler için alpha
-    selective_alpha_max: float = 1.0                  # max değişim olan pair'ler için alpha
-    selective_mapping: str = "linear"                 # "linear", "sigmoid", "step"
+    selective_change_cutoff: float = 0.15             # V6 best (grid search): bu eşiğin altı → alpha_base
+    selective_alpha_base: float = 0.05                # V6 best: değişmeyen pair'ler için alpha
+    selective_alpha_max: float = 0.7                  # V6 best: max değişim olan pair'ler için alpha
+    selective_mapping: str = "sigmoid"                # V6 best: "linear", "sigmoid", "step"
     selective_distance_mode: str = "max"              # "max", "mean"
-    selective_diagonal_band: int = 1                  # |i-j| <= band → trunk korunur (0=sadece diagonal, 1=±1, 3=±3...)
+    selective_diagonal_band: int = 2                  # V6 best: |i-j| <= band → trunk korunur (0=sadece diagonal, 1=±1, 3=±3...)
 
 
 @dataclass
