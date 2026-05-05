@@ -183,6 +183,7 @@ class ModeDriveConfig:
     selective_alpha_max: float = 1.0                  # max değişim olan pair'ler için alpha
     selective_mapping: str = "linear"                 # "linear", "sigmoid", "step"
     selective_distance_mode: str = "max"              # "max", "mean"
+    selective_diagonal_band: int = 1                  # |i-j| <= band → trunk korunur (0=sadece diagonal, 1=±1, 3=±3...)
 
 
 @dataclass

@@ -206,6 +206,7 @@ class ModeDrivePipeline:
             z_mod = selective_blend_z(
                 z_pseudo, zij_trunk, alpha_mask,
                 cfg.normalize_z, cfg.z_direction,
+                diagonal_band=cfg.selective_diagonal_band,
             )
             return z_mod, change_score, alpha_mask
 
