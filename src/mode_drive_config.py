@@ -60,7 +60,7 @@ class ModeDriveConfig:
 
     # Confidence & multi-sample
     num_diffusion_samples: int = 1               # K: samples per diffusion call
-    confidence_ptm_cutoff: float = 0.30          # safety net only (V5: 0.50 çok sıkı, TM>0.75 yapıları reject ediyordu)
+    confidence_ptm_cutoff: float = 0.15          # safety net only (V6: 0.30 hala sıkı — OF3 pTM trunk MSA'ya bağlı, yapı değiştikçe sistematik düşer)
     confidence_plddt_cutoff: float = 65.0        # minimum mean pLDDT (V5: 70 gereksiz sıkı, selective'de ~70-76 arası)
     confidence_ranking_cutoff: float = 0.45      # Eski OF3 ranking gate (use_composite_gate=False iken)
     use_composite_gate: bool = True              # True: data-driven gate (cR+pLDDT ağırlıklı)
