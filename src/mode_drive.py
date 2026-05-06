@@ -203,6 +203,8 @@ class ModeDrivePipeline:
                 cfg.selective_alpha_base, cfg.selective_alpha_max,
                 cfg.selective_mapping,
             )
+            # Move alpha_mask to same device as z tensors (coords may be CPU)
+            alpha_mask = alpha_mask.to(z_pseudo.device)
             z_mod = selective_blend_z(
                 z_pseudo, zij_trunk, alpha_mask,
                 cfg.normalize_z, cfg.z_direction,
