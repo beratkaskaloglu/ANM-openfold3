@@ -280,6 +280,12 @@ class ModeDrivePipeline:
         displaced -> contact -> z_pseudo -> blend -> diffusion -> StepResult.
         """
         cfg = self.config
+        # Ensure all coordinate tensors are on same device as zij_trunk (CUDA)
+        target_device = zij_trunk.device
+        displaced = displaced.to(target_device)
+        initial_coords_ca = initial_coords_ca.to(target_device)
+        if coords_before is not None:
+            coords_before = coords_before.to(target_device)
 
         # Contact map from displaced coordinates
         contact = coords_to_contact(
@@ -288,7 +294,7 @@ class ModeDrivePipeline:
 
         # Contact -> pseudo z_ij (move to same device as trunk z)
         z_pseudo = self.converter.contact_to_z(contact)
-        z_pseudo = z_pseudo.to(zij_trunk.device)
+        z_pseudo = z_pseudo.to(target_device)
 
         # Blend with trunk z
         z_mod, change_score, alpha_mask = self._blend_z(
@@ -323,6 +329,9 @@ class ModeDrivePipeline:
                 new_ca = diff_result
         else:
             new_ca = displaced
+
+        # Ensure new_ca is on same device as input coordinates
+        new_ca = new_ca.to(initial_coords_ca.device)
 
         # Score: RMSD from INITIAL structure (higher = more exploration)
         rmsd = compute_rmsd(initial_coords_ca, new_ca)
