@@ -284,8 +284,9 @@ class ModeDrivePipeline:
             displaced, cfg.contact_r_cut, cfg.contact_tau,
         )
 
-        # Contact -> pseudo z_ij
+        # Contact -> pseudo z_ij (move to same device as trunk z)
         z_pseudo = self.converter.contact_to_z(contact)
+        z_pseudo = z_pseudo.to(zij_trunk.device)
 
         # Blend with trunk z
         z_mod, change_score, alpha_mask = self._blend_z(
