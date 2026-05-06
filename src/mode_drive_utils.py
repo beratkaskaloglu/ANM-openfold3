@@ -62,8 +62,18 @@ def kabsch_superimpose(
     return aligned, rmsd_val
 
 
-def compute_rmsd(a: torch.Tensor, b: torch.Tensor) -> float:
-    """RMSD between two coordinate sets after Kabsch superimposition [N, 3]."""
+def compute_rmsd(a: torch.Tensor, b: torch.Tensor, seq_a: str | None = None, seq_b: str | None = None) -> float:
+    """RMSD between two coordinate sets after Kabsch superimposition.
+
+    If sizes differ and sequences are provided, auto-aligns to common core.
+    """
+    if a.shape[0] != b.shape[0]:
+        if seq_a is not None and seq_b is not None:
+            a, b, _, _, _ = align_and_trim_ca(a, seq_a, b, seq_b)
+        else:
+            # Trim to shorter length as fallback
+            n = min(a.shape[0], b.shape[0])
+            a, b = a[:n], b[:n]
     _, rmsd_val = kabsch_superimpose(a, b)
     return rmsd_val.item()
 
@@ -71,28 +81,43 @@ def compute_rmsd(a: torch.Tensor, b: torch.Tensor) -> float:
 def tm_score(
     coords_model: torch.Tensor,
     coords_ref: torch.Tensor,
+    seq_model: str | None = None,
+    seq_ref: str | None = None,
 ) -> float:
     """Approximate TM-score between two CA coordinate sets.
 
     TM-score = (1/N) * sum_i 1 / (1 + (d_i / d0)^2)
 
-    where d_i is per-residue distance after Kabsch superimposition
-    and d0 = 1.24 * (N - 15)^(1/3) - 1.8
+    If sizes differ and sequences are provided, auto-aligns to common core.
+    N for d0 normalization uses the reference length (original, not trimmed).
 
     Args:
         coords_model: [N, 3] model coordinates
-        coords_ref:   [N, 3] reference coordinates
+        coords_ref:   [M, 3] reference coordinates
+        seq_model:    sequence for model (needed if N != M)
+        seq_ref:      sequence for reference (needed if N != M)
 
     Returns:
         TM-score in [0, 1]
     """
+    N_ref_orig = coords_ref.shape[0]
+
+    if coords_model.shape[0] != coords_ref.shape[0]:
+        if seq_model is not None and seq_ref is not None:
+            coords_model, coords_ref, _, _, _ = align_and_trim_ca(
+                coords_model, seq_model, coords_ref, seq_ref
+            )
+        else:
+            n = min(coords_model.shape[0], coords_ref.shape[0])
+            coords_model, coords_ref = coords_model[:n], coords_ref[:n]
+
     aligned, _ = kabsch_superimpose(coords_ref, coords_model)
-    N = coords_ref.shape[0]
+    N = N_ref_orig  # normalize by original ref length
     d0 = 1.24 * (max(N, 16) - 15) ** (1.0 / 3.0) - 1.8
     d0 = max(d0, 0.5)
     di = ((coords_ref - aligned) ** 2).sum(dim=-1).sqrt()
     scores = 1.0 / (1.0 + (di / d0) ** 2)
-    return scores.mean().item()
+    return float(scores.sum().item()) / N
 
 
 def align_and_trim_ca(
