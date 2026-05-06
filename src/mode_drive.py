@@ -89,6 +89,9 @@ class ModeDrivePipeline:
         self.diffusion_fn = diffusion_fn
         self.structure_ctx = structure_ctx
 
+        # First prediction reference for RMSD (set after first accepted step)
+        self._first_prediction_ca: torch.Tensor | None = None
+
         # Cache of most-recent autostop trace for cheap fallback replay.
         self._autostop_last_trace = None
         self._autostop_last_coords_key: int | None = None
@@ -333,8 +336,9 @@ class ModeDrivePipeline:
         # Ensure new_ca is on same device as input coordinates
         new_ca = new_ca.to(initial_coords_ca.device)
 
-        # Score: RMSD from INITIAL structure (higher = more exploration)
-        rmsd = compute_rmsd(initial_coords_ca, new_ca)
+        # Score: RMSD from first prediction (or initial if no prediction yet)
+        rmsd_ref = self._first_prediction_ca if self._first_prediction_ca is not None else initial_coords_ca
+        rmsd = compute_rmsd(rmsd_ref.to(new_ca.device), new_ca)
 
         # ── Confidence V2 metrics ──
         mean_pae_out = None
@@ -1414,6 +1418,9 @@ class ModeDrivePipeline:
         consecutive_rejected = 0
         orig_alpha = cfg.z_mixing_alpha
 
+        # Reset first prediction reference
+        self._first_prediction_ca = None
+
         use_fallback = cfg.enable_confidence_fallback
 
         # Best-so-far rollback: en iyi yapıyı takip et, drift sonrası geri dön
@@ -1518,6 +1525,10 @@ class ModeDrivePipeline:
                 z_current = step_result.z_modified
                 consecutive_rejected = 0
                 cfg.z_mixing_alpha = orig_alpha  # restore on success
+
+                # Save first accepted prediction as RMSD reference
+                if self._first_prediction_ca is None:
+                    self._first_prediction_ca = step_result.new_ca.clone()
 
                 # ── Best-so-far rollback takibi ──
                 if has_target and cfg.enable_best_rollback:
