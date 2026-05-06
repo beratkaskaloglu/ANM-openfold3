@@ -1493,9 +1493,15 @@ class ModeDrivePipeline:
                 else:
                     fb_str = "-"
 
+                # Step 1 has no first-prediction ref yet, show "-"
+                rmsd_init_str = (
+                    f"{step_result.rmsd:>10.3f}"
+                    if self._first_prediction_ca is not None or step_idx > 0
+                    else f"{'-':>10}"
+                )
                 line = (
                     f"{step_idx+1:>6} "
-                    f"{step_result.rmsd:>10.3f} "
+                    f"{rmsd_init_str} "
                     f"{step_result.df_used:>6.2f} "
                     f"{step_result.alpha_used:>5.2f} "
                     f"{combo_label:>20}"

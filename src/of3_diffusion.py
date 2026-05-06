@@ -24,6 +24,7 @@ The wrapper:
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -408,11 +409,18 @@ class OF3ModelCache:
         query_name: str = "protein",
         chain_id: str = "A",
         num_rollout_steps: int | None = None,
+        chains_data: list[dict] | None = None,
     ) -> tuple[Callable[[torch.Tensor], "DiffusionResult | torch.Tensor"], torch.Tensor]:
         """Prepare diffusion_fn and zij_trunk for a new sequence.
 
         This re-runs the data pipeline and trunk for the new sequence
         but reuses the already-loaded model weights.
+
+        For multimer queries, pass chains_data instead of sequence/chain_id:
+            chains_data = [
+                {"chain_id": "A", "sequence": "MKTL..."},
+                {"chain_id": "B", "sequence": "GAVL..."},
+            ]
 
         Returns:
             (diffusion_fn, zij_trunk) same as load_of3_diffusion.
@@ -429,6 +437,7 @@ class OF3ModelCache:
             num_rollout_steps=num_rollout_steps,
             use_msa_server=self.use_msa_server,
             use_templates=self.use_templates,
+            chains_data=chains_data,
         )
 
 
@@ -436,8 +445,14 @@ def _prepare_sequence_impl(
     model, runner, runner_config, device, num_samples,
     sequence, query_name, chain_id,
     num_rollout_steps, use_msa_server, use_templates,
+    chains_data=None,
 ):
-    """Internal: prepare batch + run trunk for a given sequence."""
+    """Internal: prepare batch + run trunk for a given sequence.
+
+    For multimer queries, pass chains_data as a list of dicts:
+        [{"chain_id": "A", "sequence": "..."}, {"chain_id": "B", "sequence": "..."}]
+    When chains_data is provided, sequence/chain_id are ignored.
+    """
     import json as _json
     import tempfile
 
@@ -450,12 +465,22 @@ def _prepare_sequence_impl(
         get_confidence_scores,
     )
 
-    # Build query JSON
+    # Build query JSON — supports monomer and multimer
+    if chains_data is not None:
+        _chains = [
+            {"molecule_type": "protein", "chain_ids": [cd["chain_id"]], "sequence": cd["sequence"]}
+            for cd in chains_data
+        ]
+        _total_res = sum(len(cd["sequence"]) for cd in chains_data)
+        _n_chains = len(chains_data)
+    else:
+        _chains = [{"molecule_type": "protein", "chain_ids": [chain_id], "sequence": sequence}]
+        _total_res = len(sequence)
+        _n_chains = 1
+
     _query = {
         "queries": {
-            query_name: {
-                "chains": [{"molecule_type": "protein", "chain_ids": [chain_id], "sequence": sequence}]
-            }
+            query_name: {"chains": _chains}
         }
     }
     _query_dir = tempfile.mkdtemp(prefix="of3_query_")
@@ -463,8 +488,16 @@ def _prepare_sequence_impl(
     with open(_query_path, "w") as f:
         _json.dump(_query, f)
 
+    # Clear ALL ColabFold MSA cache to prevent mapping corruption across proteins
+    import shutil as _shutil
+    _msa_root = "/tmp/of3-of-root/colabfold_msas"
+    if os.path.isdir(_msa_root):
+        _shutil.rmtree(_msa_root)
+        print(f"[OF3] Cleared ColabFold MSA cache: {_msa_root}")
+
     # Prepare batch via data pipeline — create FRESH runner for data only
-    print(f"[OF3] Preparing batch for {query_name} (N={len(sequence)})...")
+    _chain_info = f"{_n_chains} chains, " if _n_chains > 1 else ""
+    print(f"[OF3] Preparing batch for {query_name} ({_chain_info}N={_total_res})...")
     from openfold3.entry_points.validator import InferenceExperimentConfig
     from openfold3.entry_points.experiment_runner import InferenceExperimentRunner
 
@@ -498,23 +531,46 @@ def _prepare_sequence_impl(
     )
     _data_runner.setup()
 
-    query_set = InferenceQuerySet.from_json(_query_path)
-    _data_runner.inference_query_set = query_set
-    data_module = _data_runner.lightning_data_module
-    data_module.prepare_data()
-    data_module.setup(stage="predict")
+    def _run_data_pipeline(_runner, _query_path_inner):
+        """Run data pipeline and return batch. Separated for retry logic."""
+        _qs = InferenceQuerySet.from_json(_query_path_inner)
+        _runner.inference_query_set = _qs
+        _dm = _runner.lightning_data_module
+        _dm.prepare_data()
+        _dm.setup(stage="predict")
+        _dl = _dm.predict_dataloader()
+        return next(iter(_dl))
 
-    predict_dl = data_module.predict_dataloader()
-    cached_batch = next(iter(predict_dl))
+    cached_batch = _run_data_pipeline(_data_runner, _query_path)
 
-    # Debug: check batch validity
+    # Check batch validity — retry once with full cache wipe if invalid
     _batch_keys = [k for k in cached_batch.keys() if isinstance(cached_batch.get(k), torch.Tensor)]
     print(f"[OF3] Batch tensor keys ({len(_batch_keys)}): {sorted(_batch_keys)[:10]}...")
-    if cached_batch.get("valid_sample") is not None:
-        _valid = cached_batch["valid_sample"]
-        if isinstance(_valid, torch.Tensor) and not _valid.all():
+    if len(_batch_keys) < 5 or (
+        cached_batch.get("valid_sample") is not None
+        and isinstance(cached_batch["valid_sample"], torch.Tensor)
+        and not cached_batch["valid_sample"].all()
+    ):
+        print("[OF3] Batch invalid — retrying with full cache wipe...")
+        # Nuke entire OF3 temp directory and recreate runner
+        _of3_tmp = "/tmp/of3-of-root"
+        if os.path.isdir(_of3_tmp):
+            _shutil.rmtree(_of3_tmp)
+            print(f"[OF3] Cleared entire OF3 temp: {_of3_tmp}")
+        _data_runner2 = InferenceExperimentRunner(
+            _data_config,
+            num_diffusion_samples=num_samples,
+            num_model_seeds=1,
+            use_msa_server=use_msa_server,
+            use_templates=use_templates,
+        )
+        _data_runner2.setup()
+        cached_batch = _run_data_pipeline(_data_runner2, _query_path)
+        _batch_keys = [k for k in cached_batch.keys() if isinstance(cached_batch.get(k), torch.Tensor)]
+        print(f"[OF3] Retry batch tensor keys ({len(_batch_keys)}): {sorted(_batch_keys)[:10]}...")
+        if len(_batch_keys) < 5:
             raise RuntimeError(
-                "[OF3] Data pipeline failed — batch marked as invalid. "
+                "[OF3] Data pipeline failed after retry — batch still invalid. "
                 "Check MSA server connectivity and query JSON format."
             )
 
@@ -525,7 +581,7 @@ def _prepare_sequence_impl(
 
     # Safety: ensure token_mask exists
     if "token_mask" not in cached_batch:
-        _n_tok = len(sequence)
+        _n_tok = _total_res
         cached_batch["token_mask"] = torch.ones(
             (1, _n_tok), dtype=torch.float32, device=torch.device(device)
         )
@@ -673,6 +729,13 @@ def load_of3_diffusion(
 
     # ── Build batch from query ─────────────────────────────────
     print("[OF3] Preparing input batch...")
+
+    # Clear ALL ColabFold MSA cache to prevent mapping corruption
+    import shutil as _shutil
+    _msa_root = "/tmp/of3-of-root/colabfold_msas"
+    if os.path.isdir(_msa_root):
+        _shutil.rmtree(_msa_root)
+        print(f"[OF3] Cleared ColabFold MSA cache: {_msa_root}")
 
     query_set = InferenceQuerySet.from_json(str(query_json))
 

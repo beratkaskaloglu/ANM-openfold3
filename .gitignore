@@ -40,5 +40,8 @@ wandb/
 .DS_Store
 Thumbs.db
 
-# Misc
-Başlıksız.canvas
+# Output & debug
+*.png
+.coverage
+results/
+search_v3/
