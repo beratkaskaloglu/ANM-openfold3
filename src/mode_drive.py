@@ -765,13 +765,17 @@ class ModeDrivePipeline:
 
         # Dispatch to autostop-specific ladder when strategy=autostop.
         if cfg.combination_strategy == "autostop":
-            return self.step_with_autostop_fallback(
+            result = self.step_with_autostop_fallback(
                 coords_ca=coords_ca,
                 initial_coords_ca=initial_coords_ca,
                 zij_trunk=zij_trunk,
                 step_idx=step_idx,
                 target_coords=target_coords,
             )
+            # Set first prediction reference on first accepted result
+            if self._first_prediction_ca is None and not result.rejected:
+                self._first_prediction_ca = result.new_ca.clone()
+            return result
 
         # Save originals
         orig_df = cfg.df
