@@ -388,10 +388,10 @@ class ModeDrivePipeline:
 
         return StepResult(
             combo=combo,
-            displaced_ca=displaced,
-            new_ca=new_ca,
+            displaced_ca=displaced.cpu(),
+            new_ca=new_ca.cpu(),
             z_modified=z_mod,
-            contact_map=contact,
+            contact_map=contact.cpu(),
             rmsd=rmsd,
             eigenvalues=eigenvalues,
             eigenvectors=eigenvectors,
