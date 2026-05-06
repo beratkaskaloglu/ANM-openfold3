@@ -1053,8 +1053,9 @@ class ModeDrivePipeline:
                     tag = "PASS"
                 tgt_str = ""
                 if target_coords is not None and result.new_ca is not None:
-                    rmsd_t = compute_rmsd(result.new_ca, target_coords)
-                    tm_t = tm_score(result.new_ca, target_coords)
+                    _new_ca = result.new_ca.to(target_coords.device)
+                    rmsd_t = compute_rmsd(_new_ca, target_coords)
+                    tm_t = tm_score(_new_ca, target_coords)
                     tgt_str = f"  RMSD_tgt={rmsd_t:.2f}A  TM_tgt={tm_t:.3f}"
                 # V2 metrics
                 v2_str = ""

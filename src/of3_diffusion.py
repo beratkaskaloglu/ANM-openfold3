@@ -463,11 +463,44 @@ def _prepare_sequence_impl(
     with open(_query_path, "w") as f:
         _json.dump(_query, f)
 
-    # Prepare batch via data pipeline
+    # Prepare batch via data pipeline — create FRESH runner for data only
     print(f"[OF3] Preparing batch for {query_name} (N={len(sequence)})...")
+    from openfold3.entry_points.validator import InferenceExperimentConfig
+    from openfold3.entry_points.experiment_runner import InferenceExperimentRunner
+
+    _data_config = InferenceExperimentConfig(
+        output_writer_settings={
+            "structure_format": "cif",
+            "write_latent_outputs": True,
+            "write_features": True,
+            "write_full_confidence_scores": False,
+        },
+        model_update={
+            "custom": {
+                "settings": {
+                    "memory": {
+                        "eval": {
+                            "use_deepspeed_evo_attention": False,
+                            "use_cueq_triangle_kernels": False,
+                            "use_triton_triangle_kernels": False,
+                        }
+                    }
+                }
+            }
+        },
+    )
+    _data_runner = InferenceExperimentRunner(
+        _data_config,
+        num_diffusion_samples=num_samples,
+        num_model_seeds=1,
+        use_msa_server=use_msa_server,
+        use_templates=use_templates,
+    )
+    _data_runner.setup()
+
     query_set = InferenceQuerySet.from_json(_query_path)
-    runner.inference_query_set = query_set
-    data_module = runner.lightning_data_module
+    _data_runner.inference_query_set = query_set
+    data_module = _data_runner.lightning_data_module
     data_module.prepare_data()
     data_module.setup(stage="predict")
 
