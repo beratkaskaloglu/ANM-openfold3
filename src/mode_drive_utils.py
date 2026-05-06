@@ -95,6 +95,69 @@ def tm_score(
     return scores.mean().item()
 
 
+def align_and_trim_ca(
+    ca_a: torch.Tensor,
+    seq_a: str,
+    ca_b: torch.Tensor,
+    seq_b: str,
+) -> tuple[torch.Tensor, torch.Tensor, str, list[int], list[int]]:
+    """Align sequences and return common-core CA coordinates.
+
+    When two PDB structures of the same protein have different numbers of
+    resolved residues, this function finds their common positions via
+    pairwise sequence alignment.
+
+    Args:
+        ca_a:  [Na, 3] CA coordinates of structure A.
+        seq_a: Sequence of structure A (len Na).
+        ca_b:  [Nb, 3] CA coordinates of structure B.
+        seq_b: Sequence of structure B (len Nb).
+
+    Returns:
+        ca_a_trimmed: [M, 3] common core of A.
+        ca_b_trimmed: [M, 3] common core of B.
+        common_seq:   Common sequence (length M).
+        idx_a:        Indices into A for the common core.
+        idx_b:        Indices into B for the common core.
+    """
+    from Bio.Align import PairwiseAligner
+
+    aligner = PairwiseAligner()
+    aligner.mode = "global"
+    aligner.match_score = 2
+    aligner.mismatch_score = -1
+    aligner.open_gap_score = -5
+    aligner.extend_gap_score = -0.5
+
+    alignments = aligner.align(seq_a, seq_b)
+    best = alignments[0]
+
+    # Extract matched positions (no gap in either sequence)
+    idx_a: list[int] = []
+    idx_b: list[int] = []
+    pos_a, pos_b = 0, 0
+
+    aligned_a = str(best[0])
+    aligned_b = str(best[1])
+
+    for char_a, char_b in zip(aligned_a, aligned_b):
+        gap_a = char_a == "-"
+        gap_b = char_b == "-"
+        if not gap_a and not gap_b:
+            idx_a.append(pos_a)
+            idx_b.append(pos_b)
+        if not gap_a:
+            pos_a += 1
+        if not gap_b:
+            pos_b += 1
+
+    ca_a_trim = ca_a[idx_a]
+    ca_b_trim = ca_b[idx_b]
+    common_seq = "".join(seq_a[i] for i in idx_a)
+
+    return ca_a_trim, ca_b_trim, common_seq, idx_a, idx_b
+
+
 def contact_to_distance(contact: torch.Tensor, r_cut: float, tau: float) -> torch.Tensor:
     """Invert sigmoid soft contact to approximate distances.
 
